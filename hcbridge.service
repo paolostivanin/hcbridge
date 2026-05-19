@@ -1,0 +1,48 @@
+[Unit]
+Description=Home Connect to MQTT bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hcbridge
+Group=hcbridge
+
+ExecStart=/opt/hcbridge/hcbridge --mode=run --config=/etc/hcbridge/config.yaml
+
+# -------------------------------------------------------------------
+# Restart policy
+# -------------------------------------------------------------------
+Restart=always
+RestartSec=2
+
+# -------------------------------------------------------------------
+# Security Hardening
+# -------------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+
+ReadOnlyPaths=/opt/hcbridge
+ReadWritePaths=/var/log/hcbridge /var/lib/hcbridge
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+DevicePolicy=closed
+ProtectProc=invisible
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+
+SystemCallFilter=@system-service
+RestrictSUIDSGID=yes
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

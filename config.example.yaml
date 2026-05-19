@@ -1,0 +1,37 @@
+# ─── OAuth (Home Connect developer credentials) ──────────────────
+# Register an application at https://developer.home-connect.com/
+# - OAuth Flow:  Device Flow
+# - Client Type: Single Key
+# - Success/Failure URLs: not used in device flow, leave default
+# Then copy the Client ID below. There is no client secret in device flow.
+oauth:
+  client_id: "REPLACE_ME"
+  # Default scopes are sufficient for a hob; widen if controlling other appliances.
+  # scopes:
+  #   - IdentifyAppliance
+  #   - Hob-Monitor
+  #   - Hob-Control
+  #   - Hob-Settings
+  # region: global         # global | cn
+  # token_file: /var/lib/hcbridge/token.json
+
+# ─── Appliance ───────────────────────────────────────────────────
+# Leave ha_id empty initially, then run:  hcbridge --mode=list-appliances
+# Copy the haId for your hob into ha_id below.
+appliance:
+  ha_id: ""
+  topic_slug: "cooktop"      # MQTT topic root: homeconnect/<topic_slug>/...
+  friendly_id: "Cooktop"      # HA device friendly name
+
+# ─── MQTT broker ──────────────────────────────────────────────────
+mqtt:
+  host: "192.168.x.x"
+  port: 1883
+  # username: ""
+  # password: ""
+  # client_id: hcbridge
+  # discovery_topic: homeassistant   # HA's MQTT discovery prefix
+
+# ─── Logging ─────────────────────────────────────────────────────
+logfile: "/var/log/hcbridge/hcbridge.log"
+log_level: "INFO"          # DEBUG / INFO / WARN / ERROR

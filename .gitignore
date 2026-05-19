@@ -1,0 +1,7 @@
+/hcbridge
+*.log
+/token.json
+/config.yaml
+.idea/
+/log.txt
+*-dump.txt
