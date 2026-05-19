@@ -122,7 +122,8 @@ Confirmed by direct API probing on PXX801D67E (firmware May 2026):
 
    On **Alpine** (OpenRC — no systemd):
    ```sh
-   adduser -S -D -H -s /sbin/nologin hcbridge
+   addgroup -S hcbridge
+   adduser -S -D -H -s /sbin/nologin -G hcbridge hcbridge
    mkdir -p /opt/hcbridge /etc/hcbridge /var/lib/hcbridge /var/log/hcbridge
    install -m 0755 hcbridge /opt/hcbridge/
    install -m 0640 -o hcbridge -g hcbridge config.example.yaml /etc/hcbridge/config.yaml
