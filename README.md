@@ -100,10 +100,16 @@ Confirmed by direct API probing on PXX801D67E (firmware May 2026):
    ```sh
    git clone <this repo>
    cd hcbridge
-   go build -o hcbridge .
+   CGO_ENABLED=0 go build -o hcbridge .
    ```
+   `CGO_ENABLED=0` produces a static binary with no libc dependency. This
+   matters if you build on one distro and deploy on another — in particular,
+   a glibc-linked binary built on Debian will not run on Alpine (musl). The
+   bridge has no cgo deps, so disabling it costs nothing.
 
 3. **Install** (LXC / Linux host):
+
+   On **Debian** (systemd):
    ```sh
    sudo useradd --system --no-create-home --shell /usr/sbin/nologin hcbridge
    sudo mkdir -p /opt/hcbridge /etc/hcbridge /var/lib/hcbridge /var/log/hcbridge
@@ -113,6 +119,29 @@ Confirmed by direct API probing on PXX801D67E (firmware May 2026):
    sudo install -m 0644 hcbridge.service /etc/systemd/system/
    sudo systemctl daemon-reload
    ```
+
+   On **Alpine** (OpenRC — no systemd):
+   ```sh
+   adduser -S -D -H -s /sbin/nologin hcbridge
+   mkdir -p /opt/hcbridge /etc/hcbridge /var/lib/hcbridge /var/log/hcbridge
+   install -m 0755 hcbridge /opt/hcbridge/
+   install -m 0640 -o hcbridge -g hcbridge config.example.yaml /etc/hcbridge/config.yaml
+   chown hcbridge:hcbridge /var/lib/hcbridge /var/log/hcbridge
+   ```
+   Then create `/etc/init.d/hcbridge`:
+   ```sh
+   #!/sbin/openrc-run
+   name="hcbridge"
+   command="/opt/hcbridge/hcbridge"
+   command_args="--mode=run --config=/etc/hcbridge/config.yaml"
+   command_user="hcbridge:hcbridge"
+   command_background="yes"
+   pidfile="/run/hcbridge.pid"
+   depend() { need net; after firewall; }
+   ```
+   `chmod +x /etc/init.d/hcbridge`. Because there's no journald, set
+   `logfile: /var/log/hcbridge/hcbridge.log` in the config — lumberjack
+   handles rotation in-process (1MB × 3 backups × 14 days, gzip).
 
 4. **Configure**: edit `/etc/hcbridge/config.yaml` — at minimum, set
    `oauth.client_id` and `mqtt.host`.
@@ -131,9 +160,18 @@ Confirmed by direct API probing on PXX801D67E (firmware May 2026):
    Copy the `haId` for your hob into `appliance.ha_id` in the config.
 
 7. **Start**:
+
+   Debian:
    ```sh
    sudo systemctl enable --now hcbridge
    journalctl -u hcbridge -f
+   ```
+
+   Alpine:
+   ```sh
+   rc-update add hcbridge default
+   rc-service hcbridge start
+   tail -f /var/log/hcbridge/hcbridge.log
    ```
 
 ## Verify without MQTT (debug mode)

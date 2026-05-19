@@ -38,13 +38,13 @@ func parseLevel(s string) int {
 func NewLogger(file, level string) *Logger {
 	var w io.Writer = os.Stdout
 	if file != "" {
-		w = io.MultiWriter(os.Stdout, &lumberjack.Logger{
+		w = &lumberjack.Logger{
 			Filename:   file,
-			MaxSize:    10,
+			MaxSize:    1,
 			MaxBackups: 3,
-			MaxAge:     30,
+			MaxAge:     14,
 			Compress:   true,
-		})
+		}
 	}
 	return &Logger{
 		level: parseLevel(level),
