@@ -32,7 +32,10 @@ Read-only sensors (real-time via SSE):
 
 Per-zone "last observed" sensors — bridge maintains a state map for all 4
 zones, updated whenever the panel's focus shifts (every panel touch). Polled
-every 5 s while the hob is on; resets to `off` when PowerState=Off.
+every 5 s while the hob is on; resets to `off` when PowerState=Off. While a
+pair is flex-joined, the focused half's power is mirrored onto its partner
+(Home Connect reports only the focused half), so both halves read the same
+live level; the mirror clears on un-join.
 - `sensor.cooktop_zone_front_left_power` / `_front_right_power`
   / `_rear_left_power` / `_rear_right_power`
 - `binary_sensor.cooktop_joined_left` — left zones flex-merged
@@ -60,7 +63,9 @@ Confirmed by direct API probing on PXX801D67E (firmware May 2026):
   zone is visible (`Cooking.Hob.Option.ZoneSelector` returns one zone at a
   time). The bridge works around this by maintaining a "last observed" state
   map for each zone — accurate as long as the user touches each zone before
-  changing it (which is normal panel use).
+  changing it (which is normal panel use). Flex-joined pairs are the one case
+  the user can't "touch each half" (they act as a single area), so the bridge
+  mirrors the focused half's power onto its partner while joined.
 - **Per-zone push events**: Bosch sends program-level option changes
   (`Duration`, `RemainingProgramTime`, `ProgramProgress`) over SSE, but **not**
   `ZoneSelector` / `PowerLevel` / `JoinZone`. The bridge polls
@@ -231,7 +236,8 @@ State (retained, published by the bridge):
 - `homeconnect/cooktop/status/rate_limited` — `true` | `false`
 - `homeconnect/cooktop/status/rate_limited_until` — RFC3339 wall-clock or empty
 - `homeconnect/cooktop/zone/{front_left,front_right,rear_left,rear_right}/power`
-  — `off`, `1`, `1.5`, `2`, …, `9` per zone (last observed)
+  — `off`, `1`, `1.5`, `2`, …, `9` per zone (last observed; a flex-joined
+  pair mirrors the focused half onto its partner)
 - `homeconnect/cooktop/joined_left` / `joined_right` — `true` | `false`
 - `homeconnect/cooktop/event/alarm_clock_elapsed` (non-retained)
 - `homeconnect/cooktop/event/program_finished` (non-retained)

@@ -281,25 +281,49 @@ func (b *Bridge) PollActiveOptions(ctx context.Context) {
 }
 
 // updateZone applies one observation of a focused zone to the state map and
-// publishes the per-zone power topic (plus join-side topic when seen).
+// publishes the per-zone power topic (plus join-side topic when seen). While a
+// pair is flex-joined the focused zone's power is mirrored onto its partner —
+// Home Connect only ever reports the focused half, so without this the other
+// half's per-zone tile stays stale at "off". On the join→unjoin transition the
+// partner is dropped back to off (it self-corrects on its next focus).
 func (b *Bridge) updateZone(zone, power string, joined, sawJoin bool) {
 	if power == "" {
 		power = "off"
 	}
 	b.mu.Lock()
 	b.zoneState[zone] = power
+	var wasJoined bool
 	if sawJoin {
 		switch zone {
 		case "FrontLeft", "RearLeft":
-			b.joinedLeft = joined
+			wasJoined, b.joinedLeft = b.joinedLeft, joined
 		case "FrontRight", "RearRight":
-			b.joinedRight = joined
+			wasJoined, b.joinedRight = b.joinedRight, joined
 		}
+	}
+	// Mirror power across the flex-joined pair (clear it on un-join). The reset
+	// keys off the *previous* join state, not merely joined==false, so an
+	// independent (never-joined) zone is never zeroed during normal use.
+	partner, partnerPower := "", ""
+	if sawJoin {
+		if p := partnerZone(zone); p != "" {
+			if joined {
+				partner, partnerPower = p, power
+			} else if wasJoined {
+				partner, partnerPower = p, "off"
+			}
+		}
+	}
+	if partner != "" {
+		b.zoneState[partner] = partnerPower
 	}
 	jl, jr := b.joinedLeft, b.joinedRight
 	b.mu.Unlock()
 
 	b.publish("zone/"+zoneSlug(zone)+"/power", power, true)
+	if partner != "" {
+		b.publish("zone/"+zoneSlug(partner)+"/power", partnerPower, true)
+	}
 	if sawJoin {
 		switch zone {
 		case "FrontLeft", "RearLeft":
@@ -376,6 +400,22 @@ func zoneSlug(zone string) string {
 		out.WriteRune(r)
 	}
 	return out.String()
+}
+
+// partnerZone returns the other half of a zone's flex-induction pair, or ""
+// if the zone has no partner.
+func partnerZone(zone string) string {
+	switch zone {
+	case "FrontLeft":
+		return "RearLeft"
+	case "RearLeft":
+		return "FrontLeft"
+	case "FrontRight":
+		return "RearRight"
+	case "RearRight":
+		return "FrontRight"
+	}
+	return ""
 }
 
 func (b *Bridge) handleCommand(_ mqtt.Client, msg mqtt.Message) {
