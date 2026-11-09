@@ -1,5 +1,5 @@
 [Unit]
-Description=Home Connect to MQTT bridge
+Description=Home Connect (local) to MQTT bridge
 After=network-online.target
 Wants=network-online.target
 
@@ -15,6 +15,8 @@ ExecStart=/opt/hcbridge/hcbridge --mode=run --config=/etc/hcbridge/config.yaml
 # -------------------------------------------------------------------
 Restart=always
 RestartSec=10
+# Room for the Close handshake with the hob on stop.
+TimeoutStopSec=15
 
 # -------------------------------------------------------------------
 # Security Hardening
@@ -22,7 +24,7 @@ RestartSec=10
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 
-ReadOnlyPaths=/opt/hcbridge
+ReadOnlyPaths=/opt/hcbridge /etc/hcbridge
 StateDirectory=hcbridge
 StateDirectoryMode=0700
 LogsDirectory=hcbridge

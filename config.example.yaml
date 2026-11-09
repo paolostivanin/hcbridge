@@ -1,27 +1,17 @@
 # Unknown keys are rejected: check with  hcbridge --mode=check-config
 #
-# ─── OAuth (Home Connect developer credentials) ──────────────────
-# Register an application at https://developer.home-connect.com/
-# - OAuth Flow:  Device Flow
-# - Client Type: Single Key
-# - Success/Failure URLs: not used in device flow, leave default
-# Then copy the Client ID below. There is no client secret in device flow.
-oauth:
-  client_id: "REPLACE_ME"
-  # Default scopes are sufficient for a hob; widen if controlling other appliances.
-  # scopes:
-  #   - IdentifyAppliance
-  #   - Hob-Monitor
-  #   - Hob-Control
-  #   - Hob-Settings
-  # region: global         # global | cn
-  # token_file: /var/lib/hcbridge/token.json
-
-# ─── Appliance ───────────────────────────────────────────────────
-# Leave ha_id empty initially, then run:  hcbridge --mode=list-appliances
-# Copy the haId for your hob into ha_id below.
+# ─── Appliance (local Home Connect protocol) ─────────────────────
+# host: the hob's IP address on your LAN (give it a DHCP reservation; the
+#   bridge does not use mDNS). Port 80 is implied.
+# profile: the ZIP written by homeconnect-profile-downloader
+#   (https://github.com/bruestel/homeconnect-profile-downloader), or a
+#   directory with its extracted files. It holds the hob's key:
+#     install -d -m 0750 -o root -g hcbridge /etc/hcbridge/profile
+#     install -m 0640 -o root -g hcbridge <the.zip> /etc/hcbridge/profile/
 appliance:
-  ha_id: ""
+  host: "192.168.x.x"
+  profile: "/etc/hcbridge/profile/BOSCH-XXXXXXXXXX-XXXXXXXXXXXX.zip"
+  # ha_id: ""                 # optional: must match the profile (picks one if the ZIP has several)
   topic_slug: "cooktop"      # MQTT topic root: homeconnect/<topic_slug>/... ([a-z0-9_-] only)
   friendly_id: "Cooktop"      # HA device friendly name
 
@@ -35,6 +25,12 @@ mqtt:
   # discovery_topic: homeassistant   # HA's MQTT discovery prefix
   # tls: false                       # true = ssl:// (TLS 1.2+), default port 8883
   # ca_file: /etc/hcbridge/ca.pem    # CA for the broker certificate (needs tls: true)
+
+# ─── Local link ───────────────────────────────────────────────────
+# link:
+#   power_cycle_after: 30m   # HTTP 503 refusals this long turn power_cycle_needed on (min 1m)
+
+# state_dir: /var/lib/hcbridge  # device ID, lock, link episode, device info, liveness file
 
 # ─── Logging ─────────────────────────────────────────────────────
 logfile: "/var/log/hcbridge/hcbridge.log"

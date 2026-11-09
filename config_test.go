@@ -80,3 +80,14 @@ log_level: "INFO"
 		t.Errorf("explicit values overridden: %q %q", c.MQTT.ClientID, c.Appliance.Host)
 	}
 }
+
+// The shipped example must stay loadable.
+func TestConfigExampleLoads(t *testing.T) {
+	c, err := LoadConfig("config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Appliance.TopicSlug != "cooktop" || c.Logfile == "" {
+		t.Errorf("example parsed oddly: %+v", c.Appliance)
+	}
+}

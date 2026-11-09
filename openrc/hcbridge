@@ -5,7 +5,9 @@
 # start-stop-daemon script left it dead until someone noticed. stdout/stderr
 # go to files, so a panic or a fatal config error leaves a trace instead of
 # vanishing into /dev/null. The healthcheck restarts a wedged process: the
-# main loop rewrites /var/lib/hcbridge/alive every minute.
+# main loop rewrites <state_dir>/alive every minute, whatever the state of
+# the link to the hob (a hob refusing connections is not a reason to
+# restart the bridge; a restart cannot fix it either).
 #
 # Switching from the old script: run `rc-service hcbridge stop` with the OLD
 # script still installed, then install this one and start. Otherwise the new
@@ -13,7 +15,7 @@
 # client ID fight over the broker.
 
 name="hcbridge"
-description="Home Connect cloud to MQTT bridge"
+description="Home Connect (local) to MQTT bridge"
 supervisor="supervise-daemon"
 command="/opt/hcbridge/hcbridge"
 command_args="--mode=run --config=/etc/hcbridge/config.yaml"
@@ -21,16 +23,20 @@ command_user="hcbridge:hcbridge"
 pidfile="/run/${RC_SVCNAME}.pid"
 respawn_delay=10
 respawn_max=0
+# SIGTERM first: the bridge closes its session with the hob cleanly.
+retry="SIGTERM/15/SIGKILL/5"
 output_log="/var/log/hcbridge/stdout.log"
 error_log="/var/log/hcbridge/stderr.log"
 umask=077
 no_new_privs=yes
 
+state_dir="${state_dir:-/var/lib/hcbridge}"   # keep in sync with state_dir in the config
+
 healthcheck_delay=180
 healthcheck_timer=60
 healthcheck() {
-	[ -f /var/lib/hcbridge/alive ] || return 1
-	[ $(( $(date +%s) - $(stat -c %Y /var/lib/hcbridge/alive) )) -lt 300 ]
+	[ -f "${state_dir}/alive" ] || return 1
+	[ $(( $(date +%s) - $(stat -c %Y "${state_dir}/alive") )) -lt 300 ]
 }
 
 depend() {
