@@ -8,3 +8,17 @@
 *.tmp
 /calls.json
 /alive
+# Real appliance profiles hold the hob's key: never commit them.
+*.zip
+/profile/
+/profiles/
+*_DeviceDescription.xml
+*_FeatureMapping.xml
+/device_id
+/device.json
+/link.json
+/lock
+obs-*.jsonl
+# ...except the synthetic test profile (fake key, not a real appliance).
+!internal/homeconnect/hcfake/profile/
+!internal/homeconnect/hcfake/profile/*

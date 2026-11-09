@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic test profile modelled on a Bosch induction hob. Not real data. -->
+<device>
+  <description>
+    <type>Hob</type>
+    <brand>BOSCH</brand>
+    <model>TESTHOB01</model>
+    <version>2</version>
+    <revision>6</revision>
+    <pairableDeviceTypes>
+      <deviceType>Application</deviceType>
+    </pairableDeviceTypes>
+  </description>
+  <statusList access="read" available="true" uid="0001">
+    <status access="read" available="true" enumerationType="0101" refCID="03" refDID="80" uid="0228"/>
+    <status access="read" available="true" refCID="01" refDID="00" uid="0221"/>
+    <statusList access="read" available="true" uid="0002">
+      <status access="read" available="true" enumerationType="2302" refCID="03" refDID="80" uid="200A"/>
+      <status access="read" available="true" enumerationType="2303" refCID="03" refDID="80" uid="200C"/>
+      <status access="read" available="true" refCID="10" refDID="82" min="0" max="5940" uid="2011"/>
+      <status access="read" available="true" enumerationType="2302" refCID="03" refDID="80" uid="202E"/>
+      <status access="read" available="true" enumerationType="2303" refCID="03" refDID="80" uid="2030"/>
+      <status access="read" available="true" refCID="10" refDID="82" min="0" max="5940" uid="2035"/>
+      <status access="read" available="true" enumerationType="2302" refCID="03" refDID="80" uid="2052"/>
+      <status access="read" available="true" enumerationType="2303" refCID="03" refDID="80" uid="2054"/>
+      <status access="read" available="true" refCID="10" refDID="82" min="0" max="5940" uid="2059"/>
+      <status access="read" available="true" refCID="01" refDID="00" uid="6001"/>
+    </statusList>
+  </statusList>
+  <settingList access="readWrite" available="true" uid="0003">
+    <setting access="readWrite" available="true" enumerationType="0102" refCID="03" refDID="80" uid="0213" initValue="{&quot;broken&quot;: [}" default="2"/>
+    <setting access="readWrite" available="true" refCID="01" refDID="00" uid="0219"/>
+    <setting access="read" available="true" enumerationType="2301" refCID="03" refDID="80" uid="1139"/>
+  </settingList>
+  <eventList uid="0005">
+    <event enumerationType="2304" handling="acknowledge" level="hint" refCID="03" refDID="80" uid="020D"/>
+  </eventList>
+  <optionList access="read" available="true" uid="0009">
+    <option access="read" available="true" refCID="10" refDID="82" liveUpdate="true" uid="0242"/>
+  </optionList>
+  <programGroup available="true" uid="000B">
+    <program available="true" execution="selectOnly" uid="3001">
+      <option access="readWrite" available="true" liveUpdate="false" refUID="0242"/>
+    </program>
+  </programGroup>
+  <activeProgram access="read" validate="false" uid="0120"/>
+  <enumerationTypeList>
+    <enumerationType enid="0103">
+      <enumeration value="0"/>
+      <enumeration value="1"/>
+      <enumeration value="2"/>
+    </enumerationType>
+    <enumerationType enid="2304" subsetOf="0103">
+      <enumeration value="0"/>
+      <enumeration value="1"/>
+    </enumerationType>
+  </enumerationTypeList>
+</device>

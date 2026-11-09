@@ -1,0 +1,14 @@
+{
+  "haId": "TEST-HOB-000000000001",
+  "type": "Hob",
+  "serialNumber": "000000000000000001",
+  "brand": "BOSCH",
+  "vib": "TESTHOB01",
+  "mac": "00-00-5E-00-53-01",
+  "featureMappingFileName": "TEST-HOB-000000000001_FeatureMapping.xml",
+  "deviceDescriptionFileName": "TEST-HOB-000000000001_DeviceDescription.xml",
+  "created": "2026-11-09T00:00:00.000Z",
+  "connectionType": "AES",
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "iv": "oKGio6SlpqeoqaqrrK2urw"
+}

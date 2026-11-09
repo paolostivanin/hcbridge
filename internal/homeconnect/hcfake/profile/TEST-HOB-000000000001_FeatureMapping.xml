@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic test profile modelled on a Bosch induction hob. Not real data. -->
+<featureMappingFile>
+  <featureDescription>
+    <feature refUID="0228">BSH.Common.Status.OperationState</feature>
+    <feature refUID="0213">BSH.Common.Setting.PowerState</feature>
+    <feature refUID="0219">BSH.Common.Setting.ChildLock</feature>
+    <feature refUID="0221">BSH.Common.Status.LocalControlActive</feature>
+    <feature refUID="0120">BSH.Common.Root.ActiveProgram</feature>
+    <feature refUID="020D">BSH.Common.Event.ProgramFinished</feature>
+    <feature refUID="0242">BSH.Common.Option.RemainingProgramTime</feature>
+    <feature refUID="1139">Cooking.Hob.Setting.Ventilation</feature>
+    <feature refUID="200A">Cooking.Hob.Status.Zone.100.State</feature>
+    <feature refUID="200C">Cooking.Hob.Status.Zone.100.PowerLevel</feature>
+    <feature refUID="2011">Cooking.Hob.Status.Zone.100.RemainingProgramTime</feature>
+    <feature refUID="202E">Cooking.Hob.Status.Zone.200.State</feature>
+    <feature refUID="2030">Cooking.Hob.Status.Zone.200.PowerLevel</feature>
+    <feature refUID="2035">Cooking.Hob.Status.Zone.200.RemainingProgramTime</feature>
+    <feature refUID="2052">Cooking.Hob.Status.Zone.120.State</feature>
+    <feature refUID="2054">Cooking.Hob.Status.Zone.120.PowerLevel</feature>
+    <feature refUID="2059">Cooking.Hob.Status.Zone.120.RemainingProgramTime</feature>
+    <feature refUID="3001">Cooking.Hob.Program.PowerLevelMode</feature>
+    <feature refUID="5001">Test.MappingOnly.Feature</feature>
+  </featureDescription>
+  <errorDescription>
+    <error refEID="7001">Test.Error.1</error>
+  </errorDescription>
+  <enumDescriptionList>
+    <enumDescription refENID="0101" enumKey="BSH.Common.EnumType.OperationState">
+      <enumMember refValue="0">Inactive</enumMember>
+      <enumMember refValue="1">Ready</enumMember>
+      <enumMember refValue="2">DelayedStart</enumMember>
+      <enumMember refValue="3">Run</enumMember>
+      <enumMember refValue="4">Pause</enumMember>
+      <enumMember refValue="5">ActionRequired</enumMember>
+      <enumMember refValue="6">Finished</enumMember>
+      <enumMember refValue="7">Error</enumMember>
+      <enumMember refValue="8">Aborting</enumMember>
+    </enumDescription>
+    <enumDescription refENID="0102" enumKey="BSH.Common.EnumType.PowerState">
+      <enumMember refValue="0">MainsOff</enumMember>
+      <enumMember refValue="1">Off</enumMember>
+      <enumMember refValue="2">On</enumMember>
+      <enumMember refValue="3">Standby</enumMember>
+    </enumDescription>
+    <enumDescription refENID="0103" enumKey="BSH.Common.EnumType.EventPresentState">
+      <enumMember refValue="0">Off</enumMember>
+      <enumMember refValue="1">Present</enumMember>
+      <enumMember refValue="2">Confirmed</enumMember>
+    </enumDescription>
+    <enumDescription refENID="2301" enumKey="Cooking.Hob.EnumType.Ventilation">
+      <enumMember refValue="0">Off</enumMember>
+      <enumMember refValue="1">Automatic</enumMember>
+      <enumMember refValue="11">Level01</enumMember>
+      <enumMember refValue="12">Level02</enumMember>
+      <enumMember refValue="13">Level03</enumMember>
+      <enumMember refValue="14">Level04</enumMember>
+      <enumMember refValue="15">Level05</enumMember>
+      <enumMember refValue="16">Level06</enumMember>
+      <enumMember refValue="17">Level07</enumMember>
+      <enumMember refValue="18">Level08</enumMember>
+      <enumMember refValue="19">Level09</enumMember>
+      <enumMember refValue="20">Level10</enumMember>
+      <enumMember refValue="21">Level11</enumMember>
+      <enumMember refValue="22">Level12</enumMember>
+      <enumMember refValue="23">Level13</enumMember>
+      <enumMember refValue="24">Level14</enumMember>
+      <enumMember refValue="25">Level15</enumMember>
+      <enumMember refValue="26">Level16</enumMember>
+      <enumMember refValue="27">Level17</enumMember>
+      <enumMember refValue="95">BoostLevel1</enumMember>
+      <enumMember refValue="96">BoostLevel2</enumMember>
+      <enumMember refValue="101">AfterRun</enumMember>
+    </enumDescription>
+    <enumDescription refENID="2302" enumKey="Cooking.Hob.EnumType.ZoneState">
+      <enumMember refValue="0">NotSelectable</enumMember>
+      <enumMember refValue="1">Off</enumMember>
+      <enumMember refValue="2">Active</enumMember>
+      <enumMember refValue="3">ResiduelHeat</enumMember>
+    </enumDescription>
+    <enumDescription refENID="2303" enumKey="Cooking.Hob.EnumType.PowerLevel">
+      <enumMember refValue="0">Off</enumMember>
+      <enumMember refValue="1">KeepWarm</enumMember>
+      <enumMember refValue="2">10</enumMember>
+      <enumMember refValue="3">15</enumMember>
+      <enumMember refValue="4">20</enumMember>
+      <enumMember refValue="5">25</enumMember>
+      <enumMember refValue="6">30</enumMember>
+      <enumMember refValue="7">35</enumMember>
+      <enumMember refValue="8">40</enumMember>
+      <enumMember refValue="9">45</enumMember>
+      <enumMember refValue="10">50</enumMember>
+      <enumMember refValue="11">55</enumMember>
+      <enumMember refValue="12">60</enumMember>
+      <enumMember refValue="13">65</enumMember>
+      <enumMember refValue="14">70</enumMember>
+      <enumMember refValue="15">75</enumMember>
+      <enumMember refValue="16">80</enumMember>
+      <enumMember refValue="17">85</enumMember>
+      <enumMember refValue="18">90</enumMember>
+      <enumMember refValue="20">Boost1</enumMember>
+      <enumMember refValue="21">Boost2</enumMember>
+    </enumDescription>
+  </enumDescriptionList>
+</featureMappingFile>
