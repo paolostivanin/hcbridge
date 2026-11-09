@@ -15,7 +15,9 @@ import (
 
 func main() {
 	configPath := flag.String("config", "/etc/hcbridge/config.yaml", "Path to config file")
-	mode := flag.String("mode", "run", "Mode: run | check-config | auth | list-appliances | watch | dump | put")
+	mode := flag.String("mode", "run", "Mode: run | check-config | local-watch | auth | list-appliances | watch | dump | put")
+	raw := flag.Bool("raw", false, "local-watch: also print every decrypted frame")
+	record := flag.String("record", "", "local-watch: append the received values as JSON lines to this file")
 	putKey := flag.String("key", "", "Key for --mode=put (e.g. BSH.Common.Setting.ChildLock)")
 	putValue := flag.String("value", "", "JSON value for --mode=put (e.g. true | 60 | '\"BSH.Common.EnumType.PowerState.Off\"')")
 	putTarget := flag.String("target", "setting", "PUT target for --mode=put: setting | active-option | selected-option")
@@ -33,9 +35,33 @@ func main() {
 		os.Exit(2)
 	}
 	if *mode == "check-config" {
-		fmt.Printf("%s: OK (appliance %q, topic root homeconnect/%s, broker %s:%d, token %s)\n",
-			*configPath, cfg.Appliance.HaID, cfg.Appliance.TopicSlug, cfg.MQTT.Host, cfg.MQTT.Port, cfg.OAuth.TokenFile)
+		fmt.Printf("%s: OK (appliance %q, topic root homeconnect/%s, broker %s:%d, state dir %s)\n",
+			*configPath, cfg.Appliance.HaID, cfg.Appliance.TopicSlug, cfg.MQTT.Host, cfg.MQTT.Port, cfg.StateDir())
+		if cfg.Appliance.Profile != "" {
+			prof, err := loadProfileFor(cfg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "profile: %v\n", err)
+				os.Exit(2)
+			}
+			printProfileSummary(os.Stdout, prof, cfg.Appliance.Profile)
+			fmt.Printf("hob address %s\n", cfg.Appliance.Host)
+		}
 		return
+	}
+
+	if *mode == "local-watch" {
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		if err := runLocalWatch(ctx, cfg, *raw, *record, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "local-watch: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\nbye")
+		return
+	}
+	if cfg.OAuth.ClientID == "" {
+		fmt.Fprintf(os.Stderr, "config: oauth.client_id is required for --mode=%s\n", *mode)
+		os.Exit(2)
 	}
 
 	log := NewLogger(cfg.Logfile, cfg.LogLevel)

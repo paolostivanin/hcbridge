@@ -27,14 +27,14 @@ func TestConfigDefaults(t *testing.T) {
 
 func TestConfigRejects(t *testing.T) {
 	cases := map[string]string{
-		"unknown key":       "oauth:\n  client_id: x\n  redirect_uri: y\n",
-		"missing client id": "mqtt:\n  host: h\n",
-		"wildcard slug":     "oauth:\n  client_id: x\nappliance:\n  topic_slug: '+'\n",
-		"slash slug":        "oauth:\n  client_id: x\nappliance:\n  topic_slug: a/b\n",
-		"bad port":          "oauth:\n  client_id: x\nmqtt:\n  port: 70000\n",
-		"bad region":        "oauth:\n  client_id: x\n  region: eu\n",
-		"ca without tls":    "oauth:\n  client_id: x\nmqtt:\n  ca_file: /x.pem\n",
-		"bad log level":     "oauth:\n  client_id: x\nlog_level: LOUD\n",
+		"unknown key":      "oauth:\n  client_id: x\n  redirect_uri: y\n",
+		"host with scheme": "oauth:\n  client_id: x\nappliance:\n  host: ws://1.2.3.4\n",
+		"wildcard slug":    "oauth:\n  client_id: x\nappliance:\n  topic_slug: '+'\n",
+		"slash slug":       "oauth:\n  client_id: x\nappliance:\n  topic_slug: a/b\n",
+		"bad port":         "oauth:\n  client_id: x\nmqtt:\n  port: 70000\n",
+		"bad region":       "oauth:\n  client_id: x\n  region: eu\n",
+		"ca without tls":   "oauth:\n  client_id: x\nmqtt:\n  ca_file: /x.pem\n",
+		"bad log level":    "oauth:\n  client_id: x\nlog_level: LOUD\n",
 	}
 	for name, y := range cases {
 		if _, err := parseConfig([]byte(y)); err == nil {

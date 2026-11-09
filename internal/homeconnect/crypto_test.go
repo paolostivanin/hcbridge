@@ -182,14 +182,14 @@ func TestTamperBreaksCodec(t *testing.T) {
 
 func TestReplayAndReorderRejected(t *testing.T) {
 	client, device := pair(t)
-	f1, _ := client.Seal([]byte("one"))
+	client.Seal([]byte("one")) // sent but lost
 	f2, _ := client.Seal([]byte("two"))
 	if _, err := device.Open(f2); !errors.Is(err, ErrMAC) {
 		t.Fatalf("out of order: got %v, want ErrMAC", err)
 	}
 
 	client, device = pair(t)
-	f1, _ = client.Seal([]byte("one"))
+	f1, _ := client.Seal([]byte("one"))
 	if _, err := device.Open(f1); err != nil {
 		t.Fatal(err)
 	}

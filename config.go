@@ -23,6 +23,8 @@ type Config struct {
 
 	Appliance struct {
 		HaID       string `yaml:"ha_id"`
+		Host       string `yaml:"host"`    // local protocol: the hob's IP[:port]
+		Profile    string `yaml:"profile"` // local protocol: profile ZIP or directory
 		TopicSlug  string `yaml:"topic_slug"`
 		FriendlyID string `yaml:"friendly_id"`
 	} `yaml:"appliance"`
@@ -37,6 +39,8 @@ type Config struct {
 		TLS            bool   `yaml:"tls"`
 		CAFile         string `yaml:"ca_file"`
 	} `yaml:"mqtt"`
+
+	StateDirectory string `yaml:"state_dir"`
 
 	Logfile  string `yaml:"logfile"`
 	LogLevel string `yaml:"log_level"`
@@ -116,8 +120,8 @@ func parseConfig(data []byte) (*Config, error) {
 
 func (c *Config) validate() error {
 	var errs []string
-	if c.OAuth.ClientID == "" {
-		errs = append(errs, "oauth.client_id is required")
+	if h := c.Appliance.Host; h != "" && (strings.Contains(h, "/") || strings.ContainsAny(h, " \t")) {
+		errs = append(errs, fmt.Sprintf("appliance.host must be an IP or hostname with an optional :port, got %q", h))
 	}
 	if c.OAuth.Region != "global" && c.OAuth.Region != "cn" {
 		errs = append(errs, fmt.Sprintf("oauth.region must be global or cn, got %q", c.OAuth.Region))
@@ -155,9 +159,13 @@ func (c *Config) APIBase() string {
 	return "https://api.home-connect.com"
 }
 
-// StateDir holds the bridge's runtime state: the token, the persisted API
-// call log and the liveness file. It is the token file's directory.
+// StateDir holds the bridge's runtime state: the device ID, the lock, the
+// liveness file (and, for the cloud modes, the token and the API call log).
+// It is state_dir, else the token file's directory.
 func (c *Config) StateDir() string {
+	if c.StateDirectory != "" {
+		return c.StateDirectory
+	}
 	return filepath.Dir(c.OAuth.TokenFile)
 }
 
