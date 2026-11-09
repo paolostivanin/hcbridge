@@ -48,9 +48,10 @@ var (
 // frame therefore desynchronises the connection for good; after any error
 // the Codec refuses further use and the caller must reconnect.
 //
-// A Codec is not safe for concurrent use. Seal must be serialised with the
-// frame writes (so the chain order matches the wire order) and Open is
-// called only from the read loop.
+// Seal and Open keep separate state, so one goroutine may Seal while
+// another Opens. Each of them is not safe for concurrent use with itself:
+// Seal must be serialised with the frame writes (so the chain order matches
+// the wire order) and Open is called only from the read loop.
 type Codec struct {
 	enc, dec cipher.BlockMode
 	mackey   []byte
@@ -60,7 +61,8 @@ type Codec struct {
 	txDir    byte
 	rxDir    byte
 	rand     io.Reader
-	broken   bool
+	txBroken bool // Seal side; touched only by Seal
+	rxBroken bool // Open side; touched only by Open
 }
 
 // deriveKeys returns the AES and HMAC keys for a pre-shared key.
@@ -109,7 +111,7 @@ func NewCodec(psk, iv []byte, role Role) (*Codec, error) {
 // Seal encrypts and authenticates one message and returns the frame to send
 // as a binary WebSocket message.
 func (c *Codec) Seal(msg []byte) ([]byte, error) {
-	if c.broken {
+	if c.txBroken {
 		return nil, ErrBroken
 	}
 	// The padding is not PKCS#7: a zero byte, random filler, and the pad
@@ -123,7 +125,7 @@ func (c *Codec) Seal(msg []byte) ([]byte, error) {
 	copy(buf, msg)
 	buf[len(msg)] = 0x00
 	if _, err := io.ReadFull(c.rand, buf[len(msg)+1:len(buf)-1]); err != nil {
-		c.broken = true
+		c.txBroken = true
 		return nil, fmt.Errorf("homeconnect: padding: %w", err)
 	}
 	buf[len(buf)-1] = byte(pad)
@@ -135,20 +137,20 @@ func (c *Codec) Seal(msg []byte) ([]byte, error) {
 
 // Open authenticates and decrypts one received frame.
 func (c *Codec) Open(frame []byte) ([]byte, error) {
-	if c.broken {
+	if c.rxBroken {
 		return nil, ErrBroken
 	}
 	if len(frame) < blockLen+macLen {
-		c.broken = true
+		c.rxBroken = true
 		return nil, ErrShortFrame
 	}
 	if len(frame)%blockLen != 0 {
-		c.broken = true
+		c.rxBroken = true
 		return nil, ErrUnaligned
 	}
 	ct, got := frame[:len(frame)-macLen], frame[len(frame)-macLen:]
 	if want := c.mac(c.rxDir, c.lastRx[:], ct); !hmac.Equal(got, want) {
-		c.broken = true
+		c.rxBroken = true
 		return nil, ErrMAC
 	}
 	copy(c.lastRx[:], got)
@@ -156,7 +158,7 @@ func (c *Codec) Open(frame []byte) ([]byte, error) {
 	c.dec.CryptBlocks(plain, ct)
 	pad := int(plain[len(plain)-1])
 	if pad < 1 || pad > len(plain) {
-		c.broken = true
+		c.rxBroken = true
 		return nil, ErrPadding
 	}
 	return plain[:len(plain)-pad], nil
