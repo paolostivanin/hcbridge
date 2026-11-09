@@ -6,25 +6,18 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	OAuth struct {
-		ClientID  string   `yaml:"client_id"`
-		Scopes    []string `yaml:"scopes"`
-		Region    string   `yaml:"region"`
-		TokenFile string   `yaml:"token_file"`
-	} `yaml:"oauth"`
-
 	Appliance struct {
-		HaID       string `yaml:"ha_id"`
-		Host       string `yaml:"host"`    // local protocol: the hob's IP[:port]
-		Profile    string `yaml:"profile"` // local protocol: profile ZIP or directory
+		Host       string `yaml:"host"`    // the hob's IP or hostname, optional :port (default 80)
+		Profile    string `yaml:"profile"` // profile ZIP (homeconnect-profile-downloader) or extracted directory
+		HaID       string `yaml:"ha_id"`   // optional: must match the profile (selects one if several)
 		TopicSlug  string `yaml:"topic_slug"`
 		FriendlyID string `yaml:"friendly_id"`
 	} `yaml:"appliance"`
@@ -40,15 +33,19 @@ type Config struct {
 		CAFile         string `yaml:"ca_file"`
 	} `yaml:"mqtt"`
 
+	Link struct {
+		// PowerCycleAfter: how long the hob may refuse local connections
+		// (HTTP 503) before power_cycle_needed turns on.
+		PowerCycleAfter time.Duration `yaml:"power_cycle_after"`
+	} `yaml:"link"`
+
 	StateDirectory string `yaml:"state_dir"`
 
 	Logfile  string `yaml:"logfile"`
 	LogLevel string `yaml:"log_level"`
-
-	// apiBase overrides APIBase(); unexported and not read from YAML, so it
-	// is only settable from tests (httptest servers).
-	apiBase string
 }
+
+const defaultStateDir = "/var/lib/hcbridge"
 
 // topicSlugRe keeps MQTT wildcards and separators out of the topic root:
 // a "+" slug would subscribe to every appliance's topics, a "#" or "/" one
@@ -68,18 +65,13 @@ func parseConfig(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true) // a typo'd key is an error, not a silent default
 	if err := dec.Decode(c); err != nil && !errors.Is(err, io.EOF) {
+		if strings.Contains(err.Error(), "field oauth not found") {
+			return nil, fmt.Errorf("parse config: the oauth block is gone in 2.0.0 (the bridge talks to the hob locally); " +
+				"remove it and set appliance.host and appliance.profile")
+		}
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	if c.OAuth.Region == "" {
-		c.OAuth.Region = "global"
-	}
-	if c.OAuth.TokenFile == "" {
-		c.OAuth.TokenFile = "/var/lib/hcbridge/token.json"
-	}
-	if len(c.OAuth.Scopes) == 0 {
-		c.OAuth.Scopes = []string{"IdentifyAppliance", "Hob-Monitor", "Hob-Control", "Hob-Settings"}
-	}
 	if c.Appliance.TopicSlug == "" {
 		c.Appliance.TopicSlug = "cooktop"
 	}
@@ -106,6 +98,12 @@ func parseConfig(data []byte) (*Config, error) {
 	if c.MQTT.DiscoveryTopic == "" {
 		c.MQTT.DiscoveryTopic = "homeassistant"
 	}
+	if c.Link.PowerCycleAfter == 0 {
+		c.Link.PowerCycleAfter = 30 * time.Minute
+	}
+	if c.StateDirectory == "" {
+		c.StateDirectory = defaultStateDir
+	}
 	if c.LogLevel == "" {
 		c.LogLevel = "INFO"
 	}
@@ -113,18 +111,21 @@ func parseConfig(data []byte) (*Config, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
-	// mqtt.host is only required in --mode=run; watch/auth/list-appliances
-	// don't need a broker. Validation happens in main.go for the run path.
+	// mqtt.host is only required in --mode=run (local-watch and
+	// check-config need no broker); main checks it there.
 	return c, nil
 }
 
 func (c *Config) validate() error {
 	var errs []string
-	if h := c.Appliance.Host; h != "" && (strings.Contains(h, "/") || strings.ContainsAny(h, " \t")) {
+	switch h := c.Appliance.Host; {
+	case h == "":
+		errs = append(errs, "appliance.host is required (the hob's IP address)")
+	case strings.Contains(h, "/") || strings.ContainsAny(h, " \t"):
 		errs = append(errs, fmt.Sprintf("appliance.host must be an IP or hostname with an optional :port, got %q", h))
 	}
-	if c.OAuth.Region != "global" && c.OAuth.Region != "cn" {
-		errs = append(errs, fmt.Sprintf("oauth.region must be global or cn, got %q", c.OAuth.Region))
+	if c.Appliance.Profile == "" {
+		errs = append(errs, "appliance.profile is required (the ZIP from homeconnect-profile-downloader)")
 	}
 	if !topicSlugRe.MatchString(c.Appliance.TopicSlug) {
 		errs = append(errs, fmt.Sprintf("appliance.topic_slug must match %s, got %q", topicSlugRe, c.Appliance.TopicSlug))
@@ -138,6 +139,9 @@ func (c *Config) validate() error {
 	if strings.ContainsAny(c.MQTT.DiscoveryTopic, "+#") {
 		errs = append(errs, fmt.Sprintf("mqtt.discovery_topic must not contain wildcards, got %q", c.MQTT.DiscoveryTopic))
 	}
+	if c.Link.PowerCycleAfter < time.Minute {
+		errs = append(errs, fmt.Sprintf("link.power_cycle_after must be at least 1m, got %s", c.Link.PowerCycleAfter))
+	}
 	switch strings.ToUpper(c.LogLevel) {
 	case "DEBUG", "INFO", "WARN", "WARNING", "ERROR":
 	default:
@@ -149,25 +153,9 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func (c *Config) APIBase() string {
-	if c.apiBase != "" {
-		return c.apiBase
-	}
-	if c.OAuth.Region == "cn" {
-		return "https://api.home-connect.cn"
-	}
-	return "https://api.home-connect.com"
-}
-
 // StateDir holds the bridge's runtime state: the device ID, the lock, the
-// liveness file (and, for the cloud modes, the token and the API call log).
-// It is state_dir, else the token file's directory.
-func (c *Config) StateDir() string {
-	if c.StateDirectory != "" {
-		return c.StateDirectory
-	}
-	return filepath.Dir(c.OAuth.TokenFile)
-}
+// last known device info and link state, and the liveness file.
+func (c *Config) StateDir() string { return c.StateDirectory }
 
 func (c *Config) StateTopic(suffix string) string {
 	return fmt.Sprintf("homeconnect/%s/%s", c.Appliance.TopicSlug, suffix)

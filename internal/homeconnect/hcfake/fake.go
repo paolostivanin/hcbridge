@@ -197,6 +197,19 @@ func (s *Server) Notify(v map[int]any) {
 	}
 }
 
+// NotifyDescription pushes NOTIFY /ro/descriptionChange for one UID, with a
+// value when value is non-nil (the hob delivers some values only this way,
+// e.g. the carbon filter saturation at power-on).
+func (s *Server) NotifyDescription(uid int, access string, value any) {
+	item := map[string]any{"uid": uid, "access": access}
+	if value != nil {
+		item["value"] = value
+	}
+	for _, c := range s.live() {
+		s.send(c, map[string]any{"sID": c.sid, "msgID": 1, "resource": "/ro/descriptionChange", "version": 1, "action": "NOTIFY", "data": []map[string]any{item}})
+	}
+}
+
 // SendRaw seals and sends arbitrary plaintext to every client.
 func (s *Server) SendRaw(plain []byte) {
 	for _, c := range s.live() {

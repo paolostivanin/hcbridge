@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // The state directory (state_dir, /var/lib/hcbridge) holds what must
@@ -103,4 +105,74 @@ func acquireLock(dir string) (release func(), err error) {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// deviceMeta is what the bridge last learned about the hob: from the profile
+// and from the handshake's device info. Persisted (device.json) so the HA
+// device block carries the firmware versions from the first discovery
+// publish, before the first connection of a run.
+type deviceMeta struct {
+	Brand     string    `json:"brand,omitempty"`
+	VIB       string    `json:"vib,omitempty"`
+	Serial    string    `json:"serial,omitempty"`
+	HaVersion string    `json:"ha_version,omitempty"` // appliance software
+	SwVersion string    `json:"sw_version,omitempty"` // network module software
+	HwVersion string    `json:"hw_version,omitempty"` // network module hardware
+	SeenAt    time.Time `json:"seen_at,omitempty"`
+}
+
+// sameVersions reports whether two metas describe the same firmware.
+func (m deviceMeta) sameVersions(o deviceMeta) bool {
+	return m.HaVersion == o.HaVersion && m.SwVersion == o.SwVersion && m.HwVersion == o.HwVersion
+}
+
+func loadDeviceMeta(dir string) (deviceMeta, error) {
+	var m deviceMeta
+	b, err := os.ReadFile(filepath.Join(dir, "device.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return m, nil
+	}
+	if err != nil {
+		return m, err
+	}
+	return m, json.Unmarshal(b, &m)
+}
+
+func saveDeviceMeta(dir string, m deviceMeta) error {
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dir, "device.json"), append(b, '\n'), 0o600)
+}
+
+// linkRecord persists the link episode across restarts (link.json): a
+// restart in the middle of a 503 episode must neither restart the
+// power-cycle clock nor dial the hob again right away.
+type linkRecord struct {
+	State        string    `json:"state"`
+	Since        time.Time `json:"since"`
+	RefusedSince time.Time `json:"refused_since,omitempty"`
+	Latched      bool      `json:"power_cycle_needed,omitempty"`
+	LastDial     time.Time `json:"last_dial,omitempty"`
+}
+
+func loadLinkRecord(dir string) (linkRecord, error) {
+	var r linkRecord
+	b, err := os.ReadFile(filepath.Join(dir, "link.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return r, nil
+	}
+	if err != nil {
+		return r, err
+	}
+	return r, json.Unmarshal(b, &r)
+}
+
+func saveLinkRecord(dir string, r linkRecord) error {
+	b, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dir, "link.json"), append(b, '\n'), 0o600)
 }

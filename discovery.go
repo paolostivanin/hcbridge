@@ -3,8 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+
+	hc "hcbridge/internal/homeconnect"
 )
 
 // discoveryEntity is one HA MQTT discovery config.
@@ -17,27 +20,38 @@ type discoveryEntity struct {
 	// after the device is deleted in HA) recreates the IDs the dashboard
 	// uses instead of deriving new ones. For an already registered entity
 	// HA keeps the registry entry, keyed by unique_id.
-	entityID   string
-	name       string
-	diagnostic bool // bridge health rather than appliance data
-	extra      map[string]interface{}
+	entityID string
+	name     string
+	// diagnostic puts the entity in HA's diagnostic category.
+	diagnostic bool
+	// gated: appliance data, only trustworthy while the bridge has a live
+	// session with the hob. Availability is then the bridge's last will AND
+	// the link topic, so HA shows the entity as unavailable instead of
+	// frozen. Link health itself is never gated.
+	gated bool
+	extra map[string]interface{}
 }
 
-// removedEntity is a discovery config published by versions before 2.0.0.
+// removedEntity is a discovery config published by an earlier version.
 type removedEntity struct{ component, objectID string }
 
-// Entities removed in 2.0.0 as unused: no dashboard, automation or template
-// referenced them, and the alarm clock number was the bridge's only MQTT write
-// path (0 commands in six months) - removing it also removed the way for
-// anyone on the broker to burn the API quota with writes. clearRemoved()
-// publishes an empty config for each, which deletes the entity from HA.
+// Entities earlier versions published. clearRemoved() publishes an empty
+// config for each, which deletes the entity from HA.
 var removedDiscovery = []removedEntity{
+	// Removed as unused in the cloud 2.0 rewrite (the alarm clock number was
+	// the bridge's only MQTT write path).
 	{"number", "alarm_clock_minutes"},
 	{"sensor", "alarm_clock_seconds"},
 	{"sensor", "remaining_program_time"},
 	{"sensor", "focused_zone_power"},
 	{"binary_sensor", "focused_zone_joined"},
 	{"binary_sensor", "remote_start_allowed"},
+	// Cloud API only: gone with the local transport.
+	{"binary_sensor", "rate_limited"},
+	{"sensor", "rate_limited_until"},
+	{"sensor", "api_calls_24h"},
+	{"binary_sensor", "cloud_connection"},
+	{"binary_sensor", "appliance_connected"},
 }
 
 func discoveryTopic(cfg *Config, component, objectID string) string {
@@ -54,134 +68,207 @@ func discoveryEntities(cfg *Config) []discoveryEntity {
 		m["payload_off"] = "false"
 		return m
 	}
-	zone := func(objectID, slugName, name, icon string) discoveryEntity {
-		return discoveryEntity{"sensor", objectID, id("sensor", slugName), name, false, map[string]interface{}{
-			"state_topic": st("zone/" + slugName[:len(slugName)-len("_zone")] + "/power"),
-			"icon":        icon,
-		}}
+	timestamp := func(topic, icon string) map[string]interface{} {
+		return map[string]interface{}{
+			"state_topic":    topic,
+			"device_class":   "timestamp",
+			"value_template": "{{ value if value else none }}",
+			"icon":           icon,
+		}
+	}
+	data := func(component, objectID, entity, name string, extra map[string]interface{}) discoveryEntity {
+		return discoveryEntity{component, objectID, id(component, entity), name, false, true, extra}
 	}
 
-	return []discoveryEntity{
-		{"sensor", "operation_state", id("sensor", "operation_state"), "Operation state", false, map[string]interface{}{
+	zones := []struct{ zone, label, icon string }{
+		{"FrontLeft", "Front-left", "mdi:circle-slice-1"},
+		{"FrontRight", "Front-right", "mdi:circle-slice-2"},
+		{"RearLeft", "Rear-left", "mdi:circle-slice-3"},
+		{"RearRight", "Rear-right", "mdi:circle-slice-4"},
+	}
+
+	es := []discoveryEntity{
+		data("sensor", "operation_state", "operation_state", "Operation state", map[string]interface{}{
 			"state_topic": st("status/operation_state"),
 			"icon":        "mdi:pot-steam",
-		}},
-		{"sensor", "power_state", id("sensor", "power_state"), "Power state", false, map[string]interface{}{
+		}),
+		data("sensor", "power_state", "power_state", "Power state", map[string]interface{}{
 			"state_topic": st("status/power_state"),
 			"icon":        "mdi:power",
-		}},
-		{"sensor", "active_program", id("sensor", "active_program"), "Active program", false, map[string]interface{}{
+		}),
+		data("sensor", "active_program", "active_program", "Active program", map[string]interface{}{
 			"state_topic": st("status/active_program"),
 			"icon":        "mdi:pot",
-		}},
-		{"sensor", "program_duration", id("sensor", "program_duration"), "Program duration", false, map[string]interface{}{
+		}),
+		data("sensor", "program_duration", "program_duration", "Program duration", map[string]interface{}{
 			"state_topic":         st("status/program_duration"),
 			"unit_of_measurement": "s",
 			"device_class":        "duration",
 			"icon":                "mdi:timer-cog",
-		}},
-		{"sensor", "elapsed_program_time", id("sensor", "elapsed_program_time"), "Elapsed program time", false, map[string]interface{}{
+		}),
+		data("sensor", "elapsed_program_time", "elapsed_program_time", "Elapsed program time", map[string]interface{}{
 			"state_topic":         st("status/elapsed_program_time"),
 			"unit_of_measurement": "s",
 			"device_class":        "duration",
 			"icon":                "mdi:clock-start",
-		}},
-		{"sensor", "program_progress", id("sensor", "program_progress"), "Program progress", false, map[string]interface{}{
+		}),
+		data("sensor", "program_progress", "program_progress", "Program progress", map[string]interface{}{
 			"state_topic":         st("status/program_progress"),
 			"unit_of_measurement": "%",
 			"icon":                "mdi:progress-clock",
-		}},
-		{"sensor", "focused_zone", id("sensor", "focused_zone"), "Focused zone", false, map[string]interface{}{
+		}),
+		// The zone the panel has focus on (the hob pushes it on every touch).
+		data("sensor", "focused_zone", "focused_zone", "Focused zone", map[string]interface{}{
 			"state_topic": st("status/focused_zone"),
 			"icon":        "mdi:circle-double",
-		}},
-
-		// Per-zone "last observed" power level. The bridge maintains a state
-		// map for all 4 zones and updates each one whenever the panel's focus
-		// shifts to it. Resets to "off" when PowerState=Off.
-		zone("zone_front_left_power", "front_left_zone", "Front-left zone", "mdi:circle-slice-1"),
-		zone("zone_front_right_power", "front_right_zone", "Front-right zone", "mdi:circle-slice-2"),
-		zone("zone_rear_left_power", "rear_left_zone", "Rear-left zone", "mdi:circle-slice-3"),
-		zone("zone_rear_right_power", "rear_right_zone", "Rear-right zone", "mdi:circle-slice-4"),
-		{"binary_sensor", "joined_left", id("binary_sensor", "left_zones_joined"), "Left zones joined", false, boolPayloads(map[string]interface{}{
+		}),
+	}
+	for _, z := range zones {
+		zs := zoneSlug(z.zone)
+		es = append(es,
+			data("sensor", "zone_"+zs+"_power", zs+"_zone", z.label+" zone", map[string]interface{}{
+				"state_topic": st("zone/" + zs + "/power"),
+				"icon":        z.icon,
+			}),
+			data("sensor", "zone_"+zs+"_state", zs+"_zone_state", z.label+" zone state", map[string]interface{}{
+				"state_topic": st("zone/" + zs + "/state"),
+				"icon":        "mdi:fire",
+			}),
+			data("sensor", "zone_"+zs+"_timer", zs+"_zone_timer", z.label+" zone timer",
+				timestamp(st("zone/"+zs+"/timer_deadline"), "mdi:timer-sand")),
+		)
+	}
+	es = append(es,
+		data("binary_sensor", "joined_left", "left_zones_joined", "Left zones joined", boolPayloads(map[string]interface{}{
 			"state_topic": st("joined_left"),
 			"icon":        "mdi:link-variant",
-		})},
-		{"binary_sensor", "joined_right", id("binary_sensor", "right_zones_joined"), "Right zones joined", false, boolPayloads(map[string]interface{}{
+		})),
+		data("binary_sensor", "joined_right", "right_zones_joined", "Right zones joined", boolPayloads(map[string]interface{}{
 			"state_topic": st("joined_right"),
 			"icon":        "mdi:link-variant",
-		})},
-
-		// Program-level timer deadline as a device_class=timestamp sensor.
-		// Bosch's API exposes only one RemainingProgramTime per active
-		// program (not per zone — see README). Empty string → value_template
-		// returns None → "unknown" instead of a stale past timestamp.
-		{"sensor", "program_timer", id("sensor", "program_timer"), "Program timer", false, map[string]interface{}{
-			"state_topic":    st("status/program_timer_deadline"),
-			"device_class":   "timestamp",
-			"value_template": "{{ value if value else none }}",
-			"icon":           "mdi:timer-sand",
-		}},
-
+		})),
+		// The program-level remaining time as a deadline (HA renders a live
+		// countdown). Each zone also has its own timer above.
+		data("sensor", "program_timer", "program_timer", "Program timer",
+			timestamp(st("status/program_timer_deadline"), "mdi:timer-sand")),
 		// No device_class: the "lock" class reads on=Unlocked, which showed an
 		// engaged child lock as unlocked.
-		{"binary_sensor", "child_lock", id("binary_sensor", "child_lock"), "Child lock", false, boolPayloads(map[string]interface{}{
+		data("binary_sensor", "child_lock", "child_lock", "Child lock", boolPayloads(map[string]interface{}{
 			"state_topic": st("status/child_lock"),
 			"icon":        "mdi:lock",
-		})},
+		})),
+		data("sensor", "fan_level", "fan_level", "Fan level", map[string]interface{}{
+			"state_topic": st("status/fan_level"),
+			"icon":        "mdi:fan",
+		}),
+		data("sensor", "carbon_filter_saturation", "carbon_filter_saturation", "Carbon filter saturation", map[string]interface{}{
+			"state_topic":         st("status/carbon_filter_saturation"),
+			"unit_of_measurement": "%",
+			"state_class":         "measurement",
+			"icon":                "mdi:air-filter",
+		}),
+		data("binary_sensor", "carbon_filter_replace", "carbon_filter_replace", "Carbon filter replace", boolPayloads(map[string]interface{}{
+			"state_topic":  st("status/carbon_filter_replace"),
+			"device_class": "problem",
+			"icon":         "mdi:air-filter",
+		})),
+	)
 
-		// ---- diagnostics: bridge and link health -------------------------
-		// These keep only the bridge's own availability topic: the rate-limit
-		// card must stay visible exactly when the cloud link is down.
-		{"binary_sensor", "local_control", id("binary_sensor", "local_control"), "Local control", true, boolPayloads(map[string]interface{}{
+	// ---- diagnostics -------------------------------------------------------
+	// Appliance-side diagnostics are gated like the data; the link health
+	// and the heartbeat keep only the bridge's own availability, so they stay
+	// visible exactly when the hob cannot be reached.
+	diag := func(e discoveryEntity) discoveryEntity { e.diagnostic = true; return e }
+	es = append(es,
+		diag(data("binary_sensor", "local_control", "local_control", "Local control", boolPayloads(map[string]interface{}{
 			"state_topic": st("status/local_control"),
 			"icon":        "mdi:gesture-tap",
-		})},
-		{"binary_sensor", "rate_limited", id("binary_sensor", "api_rate_limited"), "API rate limited", true, boolPayloads(map[string]interface{}{
-			"state_topic":  st("status/rate_limited"),
+		}))),
+		diag(data("sensor", "wifi_signal", "wifi_signal", "Wi-Fi signal", map[string]interface{}{
+			"state_topic":         st("status/wifi_signal"),
+			"unit_of_measurement": "dBm",
+			"device_class":        "signal_strength",
+			"state_class":         "measurement",
+		})),
+		diag(data("binary_sensor", "backend_connected", "home_connect_cloud", "Home Connect cloud", boolPayloads(map[string]interface{}{
+			"state_topic":  st("status/backend_connected"),
+			"device_class": "connectivity",
+		}))),
+		discoveryEntity{"sensor", "link_state", id("sensor", "local_link"), "Local link", true, false, map[string]interface{}{
+			"state_topic":  st("status/link_state"),
+			"device_class": "enum",
+			"options":      linkStateOptions(),
+			"icon":         "mdi:lan-connect",
+		}},
+		discoveryEntity{"sensor", "link_since", id("sensor", "local_link_since"), "Local link since", true, false,
+			timestamp(st("status/link_since"), "mdi:clock-outline")},
+		discoveryEntity{"binary_sensor", "power_cycle_needed", id("binary_sensor", "power_cycle_needed"), "Power cycle needed", true, false, boolPayloads(map[string]interface{}{
+			"state_topic":  st("status/power_cycle_needed"),
 			"device_class": "problem",
-			"icon":         "mdi:speedometer-slow",
+			"icon":         "mdi:power-cycle",
 		})},
-		{"sensor", "rate_limited_until", id("sensor", "api_rate_limit_clears"), "API rate limit clears", true, map[string]interface{}{
-			"state_topic":    st("status/rate_limited_until"),
-			"device_class":   "timestamp",
-			"value_template": "{{ value if value else none }}",
-			"icon":           "mdi:clock-alert-outline",
-		}},
-		{"sensor", "api_calls_24h", id("sensor", "api_calls_24h"), "API calls 24h", true, map[string]interface{}{
-			"state_topic": st("status/api_calls_24h"),
-			"state_class": "measurement",
-			"icon":        "mdi:counter",
-		}},
-		{"binary_sensor", "cloud_connection", id("binary_sensor", "cloud_connection"), "Cloud connection", true, map[string]interface{}{
-			"state_topic":  st("cloud"),
-			"payload_on":   "online",
-			"payload_off":  "offline",
-			"device_class": "connectivity",
-		}},
-		{"binary_sensor", "appliance_connected", id("binary_sensor", "appliance_connected"), "Appliance connected", true, boolPayloads(map[string]interface{}{
-			"state_topic":  st("status/appliance_online"),
-			"device_class": "connectivity",
-		})},
-		{"sensor", "heartbeat", id("sensor", "bridge_heartbeat"), "Bridge heartbeat", true, map[string]interface{}{
-			"state_topic":    st("status/heartbeat"),
-			"device_class":   "timestamp",
-			"value_template": "{{ value if value else none }}",
-			"icon":           "mdi:heart-pulse",
-		}},
+		discoveryEntity{"sensor", "heartbeat", id("sensor", "bridge_heartbeat"), "Bridge heartbeat", true, false,
+			timestamp(st("status/heartbeat"), "mdi:heart-pulse")},
+	)
+	return es
+}
+
+func linkStateOptions() []string {
+	out := make([]string, 0, len(hc.LinkStates))
+	for _, s := range hc.LinkStates {
+		out = append(out, string(s))
 	}
+	return out
+}
+
+// deviceBlock groups every entity under one HA device. The identifiers
+// never change (they key the device registry); the rest describes the hob.
+func deviceBlock(cfg *Config, meta deviceMeta) map[string]interface{} {
+	d := map[string]interface{}{
+		"identifiers":  []string{"hcbridge_" + cfg.Appliance.TopicSlug},
+		"name":         cfg.Appliance.FriendlyID,
+		"manufacturer": "Bosch",
+		"model":        "Home Connect cooktop",
+	}
+	if meta.Brand != "" {
+		d["manufacturer"] = titleCase(meta.Brand)
+	}
+	if meta.VIB != "" {
+		d["model"] = meta.VIB
+	}
+	if meta.Serial != "" {
+		d["serial_number"] = meta.Serial
+	}
+	// As the Home Connect app shows it: appliance-network module.
+	switch {
+	case meta.HaVersion != "" && meta.SwVersion != "":
+		d["sw_version"] = meta.HaVersion + "-" + meta.SwVersion
+	case meta.SwVersion != "":
+		d["sw_version"] = meta.SwVersion
+	}
+	if meta.HwVersion != "" {
+		d["hw_version"] = meta.HwVersion
+	}
+	return d
+}
+
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
 }
 
 // discoveryPayload builds the config message for one entity.
-func discoveryPayload(cfg *Config, e discoveryEntity) map[string]interface{} {
+func discoveryPayload(cfg *Config, meta deviceMeta, e discoveryEntity) map[string]interface{} {
 	slug := cfg.Appliance.TopicSlug
 	bridgeAvail := map[string]string{
 		"topic":                 cfg.StateTopic("connected"),
 		"payload_available":     "online",
 		"payload_not_available": "offline",
 	}
-	cloudAvail := map[string]string{
-		"topic":                 cfg.StateTopic("cloud"),
+	linkAvail := map[string]string{
+		"topic":                 cfg.StateTopic("link"),
 		"payload_available":     "online",
 		"payload_not_available": "offline",
 	}
@@ -189,12 +276,7 @@ func discoveryPayload(cfg *Config, e discoveryEntity) map[string]interface{} {
 		"name":              e.name,
 		"unique_id":         "hcbridge_" + slug + "_" + e.objectID,
 		"default_entity_id": e.entityID,
-		"device": map[string]interface{}{
-			"identifiers":  []string{"hcbridge_" + slug},
-			"name":         cfg.Appliance.FriendlyID,
-			"manufacturer": "Bosch",
-			"model":        "Home Connect cooktop",
-		},
+		"device":            deviceBlock(cfg, meta),
 		"origin": map[string]interface{}{
 			"name": "hcbridge",
 			"sw":   version,
@@ -203,13 +285,12 @@ func discoveryPayload(cfg *Config, e discoveryEntity) map[string]interface{} {
 	}
 	if e.diagnostic {
 		p["entity_category"] = "diagnostic"
-		p["availability"] = []map[string]string{bridgeAvail}
-	} else {
-		// Appliance data is only trustworthy while the bridge is up AND has
-		// a live event stream; otherwise HA shows it as unavailable instead
-		// of frozen at the last value.
-		p["availability"] = []map[string]string{bridgeAvail, cloudAvail}
+	}
+	if e.gated {
+		p["availability"] = []map[string]string{bridgeAvail, linkAvail}
 		p["availability_mode"] = "all"
+	} else {
+		p["availability"] = []map[string]string{bridgeAvail}
 	}
 	for k, v := range e.extra {
 		p[k] = v
@@ -220,10 +301,13 @@ func discoveryPayload(cfg *Config, e discoveryEntity) map[string]interface{} {
 // PublishDiscovery emits Home Assistant MQTT discovery configs for all entities.
 // Topics: homeassistant/<component>/hcbridge_<slug>/<object_id>/config (retained).
 // All entities share the same `device` block so HA groups them.
-func PublishDiscovery(cfg *Config, cli mqtt.Client, log *Logger) error {
+func PublishDiscovery(cfg *Config, meta deviceMeta, cli mqtt.Client, log *Logger) error {
+	if cli == nil {
+		return nil
+	}
 	entities := discoveryEntities(cfg)
 	for _, e := range entities {
-		body, err := json.Marshal(discoveryPayload(cfg, e))
+		body, err := json.Marshal(discoveryPayload(cfg, meta, e))
 		if err != nil {
 			return fmt.Errorf("marshal discovery for %s: %w", e.objectID, err)
 		}

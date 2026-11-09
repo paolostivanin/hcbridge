@@ -7,35 +7,18 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"hcbridge/internal/homeconnect/hcfake"
 )
 
-type syncBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
-}
-
 func localTestConfig(t *testing.T, host string) *Config {
 	t.Helper()
 	profDir := hcfake.WriteProfileDir(t.TempDir())
-	cfg, err := parseConfig([]byte("oauth:\n  client_id: test\nlog_level: ERROR\nappliance:\n  host: " + host +
+	cfg, err := parseConfig([]byte("log_level: ERROR\nappliance:\n  host: " + host +
 		"\n  profile: " + profDir + "\nstate_dir: " + t.TempDir() + "\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +55,8 @@ func TestLocalWatchAgainstFake(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	got := out.String()
+	spaces := regexp.MustCompile(` +`)
+	got := spaces.ReplaceAllString(out.String(), " ")
 	for _, want := range []string{
 		"[LINK]   connected",
 		"swVersion=" + hcfake.SwVersion,
@@ -80,8 +64,11 @@ func TestLocalWatchAgainstFake(t *testing.T) {
 		"8204 Cooking.Hob.Status.Zone.100.PowerLevel = 13 (65)",
 		"99999 (not in profile) = 1",
 		"[VAL]      4409 Cooking.Hob.Setting.Ventilation = 95 (BoostLevel1)",
+		"homeconnect/cooktop/status/fan_level                = 4.5 [retained]",
+		"homeconnect/cooktop/status/fan_level                = boost1 [retained]",
+		"homeconnect/cooktop/zone/front_left/power           = 6.5 [retained]",
 	} {
-		if !strings.Contains(got, want) {
+		if want = spaces.ReplaceAllString(want, " "); !strings.Contains(got, want) {
 			t.Errorf("output lacks %q\n%s", want, got)
 		}
 	}
@@ -136,7 +123,7 @@ func TestProfileSummary(t *testing.T) {
 	for _, want := range []string{
 		"connectionType AES",
 		"fan: Cooking.Hob.Setting.Ventilation is uid 4409",
-		"zone 100: PowerLevel RemainingProgramTime State",
+		"zone 100 (published as front_left): PowerLevel RemainingProgramTime State",
 		"zone 120: PowerLevel RemainingProgramTime State",
 	} {
 		if !strings.Contains(got, want) {

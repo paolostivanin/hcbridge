@@ -47,6 +47,11 @@ type Options struct {
 	NotBefore time.Time
 	// OnDial is called right before every dial attempt.
 	OnDial func(time.Time)
+	// Resume continues a failure episode from a previous run (refused,
+	// unreachable, ...): the client starts in that state instead of
+	// reporting "connecting", so retries in the same state stay silent and
+	// Since keeps marking the start of the episode.
+	Resume LinkStatus
 	// Raw emits EvRaw events with every decrypted frame (local-watch).
 	Raw bool
 
@@ -204,7 +209,14 @@ func (c *Client) Run(ctx context.Context) {
 	}()
 
 	o := &c.opts
-	c.setLink(LinkConnecting, nil)
+	if o.Resume.State != "" && o.Resume.State != LinkConnected && o.Resume.State != LinkConnecting {
+		c.mu.Lock()
+		c.link = o.Resume
+		c.lastLogged = time.Now()
+		c.mu.Unlock()
+	} else {
+		c.setLink(LinkConnecting, nil)
+	}
 	backoff := o.BackoffMin
 	firstFrameFails := 0
 	var lastDial time.Time

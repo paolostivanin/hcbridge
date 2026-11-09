@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 )
 
 // writeFileAtomic writes data to path via a uniquely named temp file in the
@@ -49,15 +48,4 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		d.Close()
 	}
 	return nil
-}
-
-// snippet renders an HTTP body for a log line: at most 300 bytes, quoted, so
-// a multi-line or HTML error page stays on one line and cannot forge log
-// entries. Never use it on a successful token-endpoint body.
-func snippet(b []byte) string {
-	const max = 300
-	if len(b) > max {
-		return strconv.Quote(string(b[:max])) + "...(truncated)"
-	}
-	return strconv.Quote(string(b))
 }

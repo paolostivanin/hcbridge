@@ -1,10 +1,13 @@
 package main
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
-// liveEntityIDs maps every kept unique_id to the entity_id HA registered for
-// it (read from the production entity registry before 2.0.0), plus the four
-// entities new in 2.0.0. The dashboard depends on these IDs.
+// liveEntityIDs maps every unique_id to the entity_id HA uses for it. The
+// first block was read from the production registry before 2.0.0; the
+// dashboard and the HA package depend on those IDs.
 var liveEntityIDs = map[string]string{
 	"hcbridge_cooktop_operation_state":        "sensor.cooktop_operation_state",
 	"hcbridge_cooktop_power_state":            "sensor.cooktop_power_state",
@@ -22,21 +25,38 @@ var liveEntityIDs = map[string]string{
 	"hcbridge_cooktop_program_timer":          "sensor.cooktop_program_timer",
 	"hcbridge_cooktop_child_lock":             "binary_sensor.cooktop_child_lock",
 	"hcbridge_cooktop_local_control":          "binary_sensor.cooktop_local_control",
-	"hcbridge_cooktop_rate_limited":           "binary_sensor.cooktop_api_rate_limited",
-	"hcbridge_cooktop_rate_limited_until":     "sensor.cooktop_api_rate_limit_clears",
-	// new in 2.0.0
-	"hcbridge_cooktop_api_calls_24h":       "sensor.cooktop_api_calls_24h",
-	"hcbridge_cooktop_cloud_connection":    "binary_sensor.cooktop_cloud_connection",
-	"hcbridge_cooktop_appliance_connected": "binary_sensor.cooktop_appliance_connected",
-	"hcbridge_cooktop_heartbeat":           "sensor.cooktop_bridge_heartbeat",
+	"hcbridge_cooktop_heartbeat":              "sensor.cooktop_bridge_heartbeat",
+	// new in 2.0.0 (local)
+	"hcbridge_cooktop_zone_front_left_state":    "sensor.cooktop_front_left_zone_state",
+	"hcbridge_cooktop_zone_front_right_state":   "sensor.cooktop_front_right_zone_state",
+	"hcbridge_cooktop_zone_rear_left_state":     "sensor.cooktop_rear_left_zone_state",
+	"hcbridge_cooktop_zone_rear_right_state":    "sensor.cooktop_rear_right_zone_state",
+	"hcbridge_cooktop_zone_front_left_timer":    "sensor.cooktop_front_left_zone_timer",
+	"hcbridge_cooktop_zone_front_right_timer":   "sensor.cooktop_front_right_zone_timer",
+	"hcbridge_cooktop_zone_rear_left_timer":     "sensor.cooktop_rear_left_zone_timer",
+	"hcbridge_cooktop_zone_rear_right_timer":    "sensor.cooktop_rear_right_zone_timer",
+	"hcbridge_cooktop_fan_level":                "sensor.cooktop_fan_level",
+	"hcbridge_cooktop_carbon_filter_saturation": "sensor.cooktop_carbon_filter_saturation",
+	"hcbridge_cooktop_carbon_filter_replace":    "binary_sensor.cooktop_carbon_filter_replace",
+	"hcbridge_cooktop_wifi_signal":              "sensor.cooktop_wifi_signal",
+	"hcbridge_cooktop_backend_connected":        "binary_sensor.cooktop_home_connect_cloud",
+	"hcbridge_cooktop_link_state":               "sensor.cooktop_local_link",
+	"hcbridge_cooktop_link_since":               "sensor.cooktop_local_link_since",
+	"hcbridge_cooktop_power_cycle_needed":       "binary_sensor.cooktop_power_cycle_needed",
 }
+
+// Entities that report on the bridge and the link: never gated by the link.
+var ungated = map[string]bool{"heartbeat": true, "link_state": true, "link_since": true, "power_cycle_needed": true}
 
 func TestDiscoveryEntityIDsAndAvailability(t *testing.T) {
 	cfg := testConfig()
 	seen := map[string]bool{}
 	for _, e := range discoveryEntities(cfg) {
-		p := discoveryPayload(cfg, e)
+		p := discoveryPayload(cfg, deviceMeta{}, e)
 		uid := p["unique_id"].(string)
+		if seen[uid] {
+			t.Errorf("duplicate entity %s", uid)
+		}
 		seen[uid] = true
 		want, ok := liveEntityIDs[uid]
 		if !ok {
@@ -49,15 +69,12 @@ func TestDiscoveryEntityIDsAndAvailability(t *testing.T) {
 		if _, ok := p["object_id"]; ok {
 			t.Errorf("%s: still sends object_id", uid)
 		}
-		if _, ok := p["device"].(map[string]interface{})["via_device"]; ok {
-			t.Errorf("%s: via_device points at a device that does not exist", uid)
-		}
 		avail := p["availability"].([]map[string]string)
-		if e.diagnostic {
-			if len(avail) != 1 || p["entity_category"] != "diagnostic" {
-				t.Errorf("%s: diagnostic entity availability %v category %v", uid, avail, p["entity_category"])
+		if ungated[e.objectID] {
+			if len(avail) != 1 || avail[0]["topic"] != cfg.StateTopic("connected") || p["entity_category"] != "diagnostic" {
+				t.Errorf("%s: link-health entity availability %v category %v", uid, avail, p["entity_category"])
 			}
-		} else if len(avail) != 2 || p["availability_mode"] != "all" || avail[1]["topic"] != cfg.StateTopic("cloud") {
+		} else if len(avail) != 2 || p["availability_mode"] != "all" || avail[1]["topic"] != cfg.StateTopic("link") {
 			t.Errorf("%s: data entity availability %v mode %v", uid, avail, p["availability_mode"])
 		}
 	}
@@ -73,11 +90,62 @@ func TestDiscoveryEntityIDsAndAvailability(t *testing.T) {
 	}
 }
 
+// Every entity 1.x or the cloud draft ever published is either still live
+// or cleaned up, so nothing lingers in HA.
+func TestNoOrphanedEntities(t *testing.T) {
+	cfg := testConfig()
+	live := map[string]bool{}
+	for _, e := range discoveryEntities(cfg) {
+		live[e.component+"/"+e.objectID] = true
+	}
+	removed := map[string]bool{}
+	for _, r := range removedDiscovery {
+		removed[r.component+"/"+r.objectID] = true
+	}
+	ever := []string{
+		// 1.x (git show c694b68:discovery.go)
+		"sensor/operation_state", "sensor/power_state", "sensor/active_program", "sensor/program_duration",
+		"sensor/elapsed_program_time", "sensor/program_progress", "sensor/remaining_program_time",
+		"sensor/focused_zone", "sensor/focused_zone_power", "binary_sensor/focused_zone_joined",
+		"sensor/zone_front_left_power", "sensor/zone_front_right_power", "sensor/zone_rear_left_power", "sensor/zone_rear_right_power",
+		"binary_sensor/joined_left", "binary_sensor/joined_right", "sensor/program_timer", "binary_sensor/child_lock",
+		"binary_sensor/local_control", "binary_sensor/remote_start_allowed", "binary_sensor/rate_limited",
+		"sensor/rate_limited_until", "sensor/alarm_clock_seconds", "number/alarm_clock_minutes",
+		// cloud 2.0 draft
+		"sensor/api_calls_24h", "binary_sensor/cloud_connection", "binary_sensor/appliance_connected", "sensor/heartbeat",
+	}
+	for _, k := range ever {
+		if !live[k] && !removed[k] {
+			t.Errorf("%s was published before but is neither live nor removed", k)
+		}
+	}
+}
+
+func TestDeviceBlock(t *testing.T) {
+	cfg := testConfig()
+	d := deviceBlock(cfg, deviceMeta{})
+	if fmt.Sprint(d["identifiers"]) != "[hcbridge_cooktop]" || d["model"] != "Home Connect cooktop" {
+		t.Fatalf("empty meta: %v", d)
+	}
+	if _, ok := d["sw_version"]; ok {
+		t.Fatal("sw_version without known versions")
+	}
+	d = deviceBlock(cfg, deviceMeta{Brand: "BOSCH", VIB: "PXX801D67E", Serial: "123", HaVersion: "1.332", SwVersion: "2.17.1.13549", HwVersion: "1.0.4.4"})
+	if d["manufacturer"] != "Bosch" || d["model"] != "PXX801D67E" || d["serial_number"] != "123" ||
+		d["sw_version"] != "1.332-2.17.1.13549" || d["hw_version"] != "1.0.4.4" ||
+		fmt.Sprint(d["identifiers"]) != "[hcbridge_cooktop]" {
+		t.Fatalf("device block %v", d)
+	}
+	if _, ok := d["connections"]; ok {
+		t.Fatal("connections would merge the device with other integrations' MAC entries")
+	}
+}
+
 func TestChildLockHasNoLockDeviceClass(t *testing.T) {
 	cfg := testConfig()
 	for _, e := range discoveryEntities(cfg) {
 		if e.objectID == "child_lock" {
-			if _, ok := discoveryPayload(cfg, e)["device_class"]; ok {
+			if _, ok := discoveryPayload(cfg, deviceMeta{}, e)["device_class"]; ok {
 				t.Fatal("child_lock has a device_class; 'lock' inverts its meaning")
 			}
 			return
@@ -86,16 +154,16 @@ func TestChildLockHasNoLockDeviceClass(t *testing.T) {
 	t.Fatal("child_lock entity missing")
 }
 
-func TestRateLimitEntitiesStayVisibleWhenCloudIsDown(t *testing.T) {
+func TestLinkStateOptions(t *testing.T) {
 	cfg := testConfig()
 	for _, e := range discoveryEntities(cfg) {
-		switch e.objectID {
-		case "rate_limited", "rate_limited_until", "cloud_connection", "heartbeat":
-			for _, a := range discoveryPayload(cfg, e)["availability"].([]map[string]string) {
-				if a["topic"] == cfg.StateTopic("cloud") {
-					t.Errorf("%s depends on the cloud topic", e.objectID)
-				}
+		if e.objectID == "link_state" {
+			got := fmt.Sprint(discoveryPayload(cfg, deviceMeta{}, e)["options"])
+			if got != "[connecting connected refused unreachable key_error error]" {
+				t.Fatalf("options %s", got)
 			}
+			return
 		}
 	}
+	t.Fatal("link_state entity missing")
 }

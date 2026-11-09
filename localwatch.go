@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,8 +20,6 @@ import (
 // device ID, same connection rules) and prints every value it pushes,
 // resolved against the profile. It exists to learn what the hob actually
 // sends before mapping it to MQTT.
-
-var zoneKeyRe = regexp.MustCompile(`^Cooking\.Hob\.(?:Status|Setting|Option)\.Zone\.(\d+)\.(\w+)$`)
 
 func runLocalWatch(ctx context.Context, cfg *Config, raw bool, recordPath string, out io.Writer) error {
 	fmt.Fprintln(os.Stderr, "note: local-watch connects to the hob with the service's device ID; "+
@@ -52,6 +49,9 @@ func runLocalWatch(ctx context.Context, cfg *Config, raw bool, recordPath string
 	}
 
 	w := &watchPrinter{out: out}
+	// A bridge without MQTT prints [PUB] lines: what the service would publish.
+	w.bridge = NewBridge(cfg, deviceMeta{}, NewLogger("", cfg.LogLevel))
+	w.bridge.out = out
 	if recordPath != "" {
 		f, err := os.OpenFile(recordPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
@@ -77,9 +77,10 @@ func loadProfileFor(cfg *Config) (*hc.Profile, error) {
 }
 
 type watchPrinter struct {
-	mu  sync.Mutex
-	out io.Writer
-	rec *json.Encoder
+	mu     sync.Mutex
+	out    io.Writer
+	rec    *json.Encoder
+	bridge *Bridge // dry run; nil in tests that only check the raw lines
 }
 
 func (w *watchPrinter) line(tag, format string, args ...any) {
@@ -149,6 +150,9 @@ func (w *watchPrinter) handle(ev hc.Event) {
 			recs = append(recs, recValue{UID: v.UID, Name: v.Name, Value: v.Raw, Symbol: v.Symbol})
 		}
 		w.record(recEntry{Kind: kind, Values: recs})
+		if w.bridge != nil {
+			w.bridge.ApplyValues(ev.Values, ev.Snapshot)
+		}
 	case hc.EvDescription:
 		for _, d := range ev.Changes {
 			name := d.Name
@@ -164,6 +168,9 @@ func (w *watchPrinter) handle(ev hc.Event) {
 				extra = " value=" + string(d.Value.Raw)
 			}
 			w.line("DESC", "%6d %s access=%s available=%s%s", d.UID, name, d.Access, avail, extra)
+		}
+		if w.bridge != nil {
+			w.bridge.ApplyDescriptions(ev.Changes)
 		}
 	case hc.EvRaw:
 		w.line("RAW", "%s %s", ev.Raw.Dir, ev.Raw.Plain)
@@ -203,12 +210,11 @@ func printProfileSummary(w io.Writer, prof *hc.Profile, path string) {
 	for _, f := range worldReadableKeyFiles(path) {
 		fmt.Fprintf(w, "WARNING: %s is world-readable; it holds the hob's key (chmod 0640, owner root, group hcbridge)\n", f)
 	}
-	zones := map[int][]string{}
+	zones := map[string][]string{}
 	var notable []string
 	for _, f := range prof.Features() {
 		if m := zoneKeyRe.FindStringSubmatch(f.Name); m != nil {
-			id, _ := strconv.Atoi(m[1])
-			zones[id] = append(zones[id], m[2])
+			zones[m[1]] = append(zones[m[1]], m[2])
 			continue
 		}
 		for _, kw := range []string{"Ventilation", "Hood", "CarbonFilter", "JoinZone", "ZoneSelector", "PowerLevel", "RemainingProgramTime"} {
@@ -223,14 +229,18 @@ func printProfileSummary(w io.Writer, prof *hc.Profile, path string) {
 	} else {
 		fmt.Fprintln(w, "fan: Cooking.Hob.Setting.Ventilation NOT in the profile")
 	}
-	ids := make([]int, 0, len(zones))
+	ids := make([]string, 0, len(zones))
 	for id := range zones {
 		ids = append(ids, id)
 	}
-	sort.Ints(ids)
+	sort.Strings(ids)
 	for _, id := range ids {
 		sort.Strings(zones[id])
-		fmt.Fprintf(w, "zone %d: %s\n", id, strings.Join(zones[id], " "))
+		used := ""
+		if _, ok := zoneHalves[id]; ok {
+			used = " (published as " + zoneSlug(zoneHalves[id]) + ")"
+		}
+		fmt.Fprintf(w, "zone %s%s: %s\n", id, used, strings.Join(zones[id], " "))
 	}
 	for _, n := range notable {
 		fmt.Fprintf(w, "key: %s\n", n)

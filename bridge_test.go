@@ -1,199 +1,254 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	hc "hcbridge/internal/homeconnect"
 )
 
-func TestApplyOptionsPublishesFocusedZone(t *testing.T) {
+func want(t *testing.T, b *Bridge, suffix, value string) {
+	t.Helper()
+	if got, ok := b.get(suffix); !ok || got != value {
+		t.Errorf("%s = %q (published %v), want %q", suffix, got, ok, value)
+	}
+}
+
+func TestProgramLevelMapping(t *testing.T) {
 	b := newTestBridge()
-	if !apply(b, []apiKV{
-		{Key: "Cooking.Hob.Option.ZoneSelector", Value: "Cooking.Hob.EnumType.ZoneSelector.FrontRight"},
-		{Key: "Cooking.Hob.Option.PowerLevel", Value: "Cooking.Hob.EnumType.PowerLevel.65"},
-		{Key: "Cooking.Hob.Option.JoinZone", Value: false},
-		{Key: "BSH.Common.Option.ElapsedProgramTime", Value: float64(90)},
-	}, true) {
-		t.Fatal("first poll reported no change")
-	}
-	want := map[string]string{
-		"status/focused_zone":         "FrontRight",
-		"zone/front_right/power":      "6.5",
-		"joined_right":                "false",
-		"status/elapsed_program_time": "90",
-	}
-	for k, v := range want {
-		if got, _ := b.get(k); got != v {
-			t.Errorf("%s = %q, want %q", k, got, v)
+	apply(b,
+		sym("BSH.Common.Status.OperationState", "Run"),
+		sym("BSH.Common.Setting.PowerState", "On"),
+		boolv("BSH.Common.Setting.ChildLock", true),
+		boolv("BSH.Common.Status.LocalControlActive", false),
+		sym("BSH.Common.Root.ActiveProgram", "Cooking.Hob.Program.PowerLevelMode"),
+		num("BSH.Common.Option.Duration", 124),
+		sym("Cooking.Hob.Option.ZoneSelector", "RearRight"),
+		num("BSH.Common.Status.WiFiSignalStrength", -44),
+		boolv("BSH.Common.Status.BackendConnected", true),
+	)
+	want(t, b, "status/operation_state", "Run")
+	want(t, b, "status/power_state", "On")
+	want(t, b, "status/child_lock", "true")
+	want(t, b, "status/local_control", "false")
+	want(t, b, "status/active_program", "Cooking.Hob.Program.PowerLevelMode")
+	want(t, b, "status/program_duration", "124")
+	want(t, b, "status/focused_zone", "RearRight")
+	want(t, b, "status/wifi_signal", "-44")
+	want(t, b, "status/backend_connected", "true")
+
+	// ActiveProgram 0 (no program) decodes to nil: an empty payload.
+	b.ApplyValues([]hc.Value{{UID: 256, Name: "BSH.Common.Root.ActiveProgram"}}, false)
+	want(t, b, "status/active_program", "")
+}
+
+func TestZonePowerAndState(t *testing.T) {
+	b := newTestBridge()
+	apply(b,
+		sym("Cooking.Hob.Status.Zone.100.State", "Active"),
+		sym("Cooking.Hob.Status.Zone.100.OperationState", "Run"),
+		sym("Cooking.Hob.Status.Zone.100.PowerLevel", "65"),
+		sym("Cooking.Hob.Status.Zone.300.PowerLevel", "Boost2"),
+		sym("Cooking.Hob.Status.Zone.400.State", "ResiduelHeat"),
+	)
+	want(t, b, "zone/front_left/power", "6.5")
+	want(t, b, "zone/front_left/state", "active")
+	want(t, b, "zone/rear_right/power", "Boost2")
+	want(t, b, "zone/front_right/state", "residual_heat")
+
+	apply(b, sym("Cooking.Hob.Status.Zone.100.OperationState", "Pause"))
+	want(t, b, "zone/front_left/state", "paused")
+	apply(b, sym("Cooking.Hob.Status.Zone.100.OperationState", "Run"))
+	want(t, b, "zone/front_left/state", "active")
+
+	// Combined and venting zones carry nothing on this hob: ignored.
+	apply(b, sym("Cooking.Hob.Status.Zone.120.PowerLevel", "50"), sym("Cooking.Hob.Status.Zone.F55.State", "Active"))
+	for suffix := range b.lastPub {
+		if strings.Contains(suffix, "120") || strings.Contains(suffix, "f55") {
+			t.Errorf("unexpected topic %s", suffix)
 		}
 	}
-	for _, gone := range []string{"status/focused_zone_power", "status/focused_zone_joined"} {
-		if _, ok := b.get(gone); ok {
-			t.Errorf("removed topic %s published", gone)
-		}
-	}
-	if apply(b, []apiKV{
-		{Key: "Cooking.Hob.Option.ZoneSelector", Value: "Cooking.Hob.EnumType.ZoneSelector.FrontRight"},
-		{Key: "Cooking.Hob.Option.PowerLevel", Value: "Cooking.Hob.EnumType.PowerLevel.65"},
-	}, true) {
-		t.Error("identical poll reported a change")
-	}
 }
 
-func TestApplyOptionsSelectedSkipsProgramOptions(t *testing.T) {
+// Observed on the PXX801D67E: a flex-joined pair is both base zones active
+// at the same level, and Option.JoinZone true while the focus is on that side.
+func TestFlexJoin(t *testing.T) {
 	b := newTestBridge()
-	apply(b, []apiKV{
-		{Key: "Cooking.Hob.Option.ZoneSelector", Value: "Cooking.Hob.EnumType.ZoneSelector.RearLeft"},
-		{Key: "BSH.Common.Option.Duration", Value: float64(600)},
-	}, false)
-	if got, _ := b.get("status/focused_zone"); got != "RearLeft" {
-		t.Errorf("focused_zone = %q, want RearLeft", got)
-	}
-	if got, _ := b.get("zone/rear_left/power"); got != "off" {
-		t.Errorf("rear_left = %q, want off (no PowerLevel)", got)
-	}
-	if _, ok := b.get("status/program_duration"); ok {
-		t.Error("program_duration published from /selected")
-	}
+	join := func(on bool) { apply(b, boolv("Cooking.Hob.Option.JoinZone", on)) }
+
+	apply(b, sym("Cooking.Hob.Option.ZoneSelector", "RearLeft"), sym("Cooking.Hob.Option.ZoneSelector", "FrontLeft"))
+	join(true)
+	want(t, b, "joined_left", "false") // flagged, but nothing cooks yet
+	apply(b,
+		sym("Cooking.Hob.Status.Zone.100.State", "Active"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "35"),
+		sym("Cooking.Hob.Status.Zone.200.State", "Active"), sym("Cooking.Hob.Status.Zone.200.PowerLevel", "35"),
+	)
+	want(t, b, "joined_left", "true")
+	want(t, b, "joined_right", "false")
+	want(t, b, "zone/front_left/power", "3.5")
+	want(t, b, "zone/rear_left/power", "3.5")
+
+	// Focus moves to the right side, which is not joined: the left stays joined.
+	apply(b, sym("Cooking.Hob.Option.ZoneSelector", "RearRight"))
+	join(false)
+	want(t, b, "joined_left", "true")
+
+	// Unjoin on the left: the flag goes false and front-left switches off.
+	apply(b, sym("Cooking.Hob.Option.ZoneSelector", "FrontLeft"))
+	join(false)
+	apply(b, sym("Cooking.Hob.Status.Zone.100.State", "Off"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "Off"))
+	want(t, b, "joined_left", "false")
+	want(t, b, "zone/front_left/power", "off")
+	want(t, b, "zone/rear_left/power", "3.5")
+
+	// A stale flag cannot outlive the cooking.
+	join(true)
+	want(t, b, "joined_left", "false")
 }
 
-func TestApplyOptionsMirrorsJoinedPartner(t *testing.T) {
+func TestTimers(t *testing.T) {
 	b := newTestBridge()
-	apply(b, []apiKV{
-		{Key: "Cooking.Hob.Option.ZoneSelector", Value: "Cooking.Hob.EnumType.ZoneSelector.FrontLeft"},
-		{Key: "Cooking.Hob.Option.PowerLevel", Value: "Cooking.Hob.EnumType.PowerLevel.40"},
-		{Key: "Cooking.Hob.Option.JoinZone", Value: true},
-	}, true)
-	if got, _ := b.get("zone/rear_left/power"); got != "4" {
-		t.Errorf("partner rear_left = %q, want 4", got)
+	start := time.Now()
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 86))
+	got, _ := b.get("zone/rear_left/timer_deadline")
+	deadline, err := time.Parse(time.RFC3339, got)
+	if err != nil || deadline.Sub(start) < 84*time.Second || deadline.Sub(start) > 88*time.Second {
+		t.Fatalf("zone timer %q (%v)", got, err)
 	}
-	apply(b, []apiKV{
-		{Key: "Cooking.Hob.Option.ZoneSelector", Value: "Cooking.Hob.EnumType.ZoneSelector.FrontLeft"},
-		{Key: "Cooking.Hob.Option.PowerLevel", Value: "Cooking.Hob.EnumType.PowerLevel.40"},
-		{Key: "Cooking.Hob.Option.JoinZone", Value: false},
-	}, true)
-	if got, _ := b.get("zone/rear_left/power"); got != "off" {
-		t.Errorf("partner after un-join = %q, want off", got)
+	// The next tick a second later lands on the same deadline: no republish.
+	b.mu.Lock()
+	before := b.lastAt["zone/rear_left/timer_deadline"]
+	b.mu.Unlock()
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 85))
+	b.mu.Lock()
+	after := b.lastAt["zone/rear_left/timer_deadline"]
+	b.mu.Unlock()
+	if !after.Equal(before) {
+		t.Error("timer tick republished the deadline")
 	}
-}
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 0))
+	want(t, b, "zone/rear_left/timer_deadline", "")
 
-func TestInFlightPollDroppedAfterPowerOff(t *testing.T) {
-	b := newTestBridge()
-	epoch := b.zoneEpoch.Load() // poll starts its GET
-	b.applyKV("BSH.Common.Setting.PowerState", "BSH.Common.EnumType.PowerState.Off")
-	b.applyOptions([]apiKV{ // ...and its response lands after the power-off
-		{Key: "Cooking.Hob.Option.ZoneSelector", Value: "Cooking.Hob.EnumType.ZoneSelector.FrontLeft"},
-		{Key: "Cooking.Hob.Option.PowerLevel", Value: "Cooking.Hob.EnumType.PowerLevel.50"},
-	}, true, epoch)
-	if got, _ := b.get("zone/front_left/power"); got != "off" {
-		t.Fatalf("front_left = %q after power-off, want off", got)
-	}
-}
-
-func TestPowerOnAgainAcceptsNewPolls(t *testing.T) {
-	b := newTestBridge()
-	b.applyKV("BSH.Common.Setting.PowerState", "BSH.Common.EnumType.PowerState.Off")
-	b.applyKV("BSH.Common.Setting.PowerState", "BSH.Common.EnumType.PowerState.On")
-	apply(b, []apiKV{
-		{Key: "Cooking.Hob.Option.ZoneSelector", Value: "Cooking.Hob.EnumType.ZoneSelector.RearRight"},
-		{Key: "Cooking.Hob.Option.PowerLevel", Value: "Cooking.Hob.EnumType.PowerLevel.90"},
-	}, true)
-	if got, _ := b.get("zone/rear_right/power"); got != "9" {
-		t.Fatalf("rear_right = %q, want 9", got)
-	}
-}
-
-func TestUnknownZoneIgnored(t *testing.T) {
-	b := newTestBridge()
-	apply(b, []apiKV{{Key: "Cooking.Hob.Option.ZoneSelector", Value: nil}}, true)
-	if _, ok := b.get("zone/<nil>/power"); ok {
-		t.Fatal("published a zone/<nil>/power topic")
-	}
-	if _, ok := b.get("status/focused_zone"); ok {
-		t.Fatal("published focused_zone for a null ZoneSelector")
-	}
-}
-
-func TestApplianceConnectedEvents(t *testing.T) {
-	b := newTestBridge()
-	b.ApplyEvent(SSEEvent{Event: "DISCONNECTED"})
-	if got, _ := b.get("status/appliance_online"); got != "false" || b.CanPoll() {
-		t.Fatalf("after DISCONNECTED: online=%q canPoll=%v", got, b.CanPoll())
-	}
-	b.ApplyEvent(SSEEvent{Event: "CONNECTED"})
-	if got, _ := b.get("status/appliance_online"); got != "true" || !b.CanPoll() {
-		t.Fatalf("after CONNECTED: online=%q canPoll=%v", got, b.CanPoll())
-	}
-}
-
-func TestStandbyIsNotActive(t *testing.T) {
-	b := newTestBridge()
-	b.applyKV("BSH.Common.Setting.PowerState", "BSH.Common.EnumType.PowerState.Standby")
-	if b.IsHobActive() {
-		t.Fatal("Standby counted as active")
-	}
-}
-
-func TestSnapshotDoesNotOverwriteNewerEvent(t *testing.T) {
-	b := newTestBridge()
-	b.applyKV("BSH.Common.Setting.PowerState", "BSH.Common.EnumType.PowerState.Off")
-	startedAt := time.Now()
-	time.Sleep(time.Millisecond)
-	// PowerState=On arrives over SSE while the snapshot request is in flight.
-	b.ApplyEvent(SSEEvent{Event: "STATUS", Items: []SSEItem{{Key: "BSH.Common.Setting.PowerState", Value: "BSH.Common.EnumType.PowerState.On"}}})
-	b.ApplySnapshot(map[string]interface{}{
-		"BSH.Common.Setting.PowerState":    "BSH.Common.EnumType.PowerState.Off", // stale
-		"BSH.Common.Status.OperationState": "BSH.Common.EnumType.OperationState.Ready",
-	}, true, startedAt)
-	if got, _ := b.get("status/power_state"); got != "On" {
-		t.Fatalf("snapshot overwrote a newer event: power_state = %q", got)
-	}
-	if got, _ := b.get("status/operation_state"); got != "Ready" {
-		t.Fatalf("snapshot keys without newer events not applied: %q", got)
-	}
-}
-
-func TestSnapshotOfflineAppliance(t *testing.T) {
-	b := newTestBridge()
-	b.ApplySnapshot(map[string]interface{}{}, false, time.Now())
-	if got, _ := b.get("status/appliance_online"); got != "false" {
-		t.Fatalf("appliance_online = %q, want false", got)
-	}
-}
-
-func TestProgramTimerJitter(t *testing.T) {
-	b := newTestBridge()
-	if !b.updateProgramTimer(600) {
-		t.Fatal("first deadline not published")
-	}
-	if b.updateProgramTimer(599) {
-		t.Error("1 s wobble republished")
-	}
-	if !b.updateProgramTimer(300) {
-		t.Error("real change not published")
-	}
-	if !b.updateProgramTimer(0) {
-		t.Error("timer clear not published")
-	}
-	if got, _ := b.get("status/program_timer_deadline"); got != "" {
-		t.Errorf("cleared deadline = %q", got)
-	}
-}
-
-func TestRemainingProgramTimeOnlyFeedsTimer(t *testing.T) {
-	b := newTestBridge()
-	b.applyKV("BSH.Common.Option.RemainingProgramTime", float64(120))
+	apply(b, num("BSH.Common.Option.RemainingProgramTime", 600))
 	if got, _ := b.get("status/program_timer_deadline"); got == "" {
-		t.Error("no deadline from RemainingProgramTime")
+		t.Fatal("program timer not published")
 	}
 	if _, ok := b.get("status/remaining_program_time"); ok {
-		t.Error("removed remaining_program_time topic published")
+		t.Fatal("remaining time published as its own topic")
 	}
+}
+
+func TestEventsAreNotRetainedAndSkippedInSnapshots(t *testing.T) {
+	b := newTestBridge()
+	out := capture(b)
+	b.ApplyValues([]hc.Value{sym("BSH.Common.Event.ProgramFinished", "Off")}, true)
+	if strings.Contains(out.String(), "event/") {
+		t.Fatalf("snapshot fired an event:\n%s", out)
+	}
+	apply(b, sym("BSH.Common.Event.ProgramFinished", "Present"))
+	line := out.String()
+	if !strings.Contains(line, "homeconnect/cooktop/event/program_finished") || !strings.Contains(line, "= Present") || strings.Contains(line, "[retained]") {
+		t.Fatalf("event publish: %s", line)
+	}
+}
+
+func TestFanLevel(t *testing.T) {
+	b := newTestBridge()
+	apply(b, sym("Cooking.Hob.Setting.Ventilation", "Level08"))
+	want(t, b, "status/fan_level", "4.5")
+	// After power-off the hob reports the after-run inside an access change.
+	b.ApplyDescriptions([]hc.Description{{UID: 4409, Name: "Cooking.Hob.Setting.Ventilation", Value: &hc.Value{Name: "Cooking.Hob.Setting.Ventilation", Symbol: "AfterRun"}}})
+	want(t, b, "status/fan_level", "afterrun")
+}
+
+func TestCarbonFilter(t *testing.T) {
+	b := newTestBridge()
+	sat := func(pct float64) {
+		b.ApplyDescriptions([]hc.Description{{UID: 4096, Name: "Cooking.Hob.Status.CarbonFilterSaturation", Access: "read",
+			Value: &hc.Value{Name: "Cooking.Hob.Status.CarbonFilterSaturation", V: pct}}})
+	}
+	if _, ok := b.get("status/carbon_filter_replace"); ok {
+		t.Fatal("replace flag published before anything is known")
+	}
+	sat(96)
+	want(t, b, "status/carbon_filter_saturation", "96")
+	want(t, b, "status/carbon_filter_replace", "true")
+	sat(40)
+	want(t, b, "status/carbon_filter_replace", "false")
+
+	// The hob's own event latches the flag until the saturation reads low.
+	b2 := newTestBridge()
+	apply(b2, sym("Cooking.Hob.Event.CarbonFilterMaxSaturationNearlyReached", "Present"))
+	want(t, b2, "status/carbon_filter_replace", "true")
+	b2.ApplyDescriptions([]hc.Description{{Name: "Cooking.Hob.Status.CarbonFilterSaturation", Value: &hc.Value{V: 80.0}}})
+	want(t, b2, "status/carbon_filter_replace", "true")
+	b2.ApplyDescriptions([]hc.Description{{Name: "Cooking.Hob.Status.CarbonFilterSaturation", Value: &hc.Value{V: 3.0}}})
+	want(t, b2, "status/carbon_filter_replace", "false")
+	// Event keys inside access changes are ignored.
+	b2.ApplyDescriptions([]hc.Description{{Name: "Cooking.Hob.Event.CarbonFilterMaxSaturationReached", Value: &hc.Value{Symbol: "Present"}}})
+	want(t, b2, "status/carbon_filter_replace", "false")
+}
+
+func TestPowerOffResets(t *testing.T) {
+	b := newTestBridge()
+	apply(b,
+		sym("BSH.Common.Setting.PowerState", "On"),
+		sym("Cooking.Hob.Option.ZoneSelector", "FrontLeft"), boolv("Cooking.Hob.Option.JoinZone", true),
+		sym("Cooking.Hob.Status.Zone.100.State", "Active"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "50"),
+		sym("Cooking.Hob.Status.Zone.200.State", "Active"), sym("Cooking.Hob.Status.Zone.200.PowerLevel", "50"),
+		sym("Cooking.Hob.Status.Zone.400.State", "ResiduelHeat"),
+		num("Cooking.Hob.Status.Zone.100.RemainingProgramTime", 300),
+		num("BSH.Common.Option.RemainingProgramTime", 300),
+		sym("Cooking.Hob.Setting.Ventilation", "Level05"),
+	)
+	want(t, b, "joined_left", "true")
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off"))
+	want(t, b, "zone/front_left/power", "off")
+	want(t, b, "zone/front_left/state", "off")
+	want(t, b, "zone/front_right/state", "residual_heat") // reported by the hob, kept
+	want(t, b, "zone/front_left/timer_deadline", "")
+	want(t, b, "status/program_timer_deadline", "")
+	want(t, b, "joined_left", "false")
+	want(t, b, "status/fan_level", "3") // the fan is the hob's to report (after-run)
+}
+
+func TestThrottledTopics(t *testing.T) {
+	b := newTestBridge()
+	tick := func(s float64) { apply(b, num("BSH.Common.Option.ElapsedProgramTime", s)) }
+	tick(0)
+	tick(1) // from zero: at once
+	want(t, b, "status/elapsed_program_time", "1")
+	tick(2) // within the gap: held back
+	want(t, b, "status/elapsed_program_time", "1")
+	b.mu.Lock()
+	b.lastAt["status/elapsed_program_time"] = time.Now().Add(-time.Minute)
+	b.mu.Unlock()
+	tick(3)
+	want(t, b, "status/elapsed_program_time", "3")
+	tick(0) // back to zero: at once
+	want(t, b, "status/elapsed_program_time", "0")
+}
+
+func TestUnknownAndIgnoredKeys(t *testing.T) {
+	b := newTestBridge()
+	b.ApplyValues([]hc.Value{{UID: 99999, Raw: []byte("1"), V: 1.0}}, false)
+	apply(b, sym("Cooking.Hob.Setting.BuzzerBeepLevel", "AllActive"), num("BSH.Common.Status.StopWatchTime", 3))
+	if len(b.lastPub) != 0 {
+		t.Fatalf("published %v", b.lastPub)
+	}
+	if !b.unmapped["uid 99999"] || !b.unmapped["Cooking.Hob.Setting.BuzzerBeepLevel"] {
+		t.Fatalf("unmapped %v", b.unmapped)
+	}
+}
+
+func TestPublishLink(t *testing.T) {
+	b := newTestBridge()
+	since := time.Date(2026, 11, 9, 16, 0, 0, 0, time.UTC)
+	b.PublishLink(hc.LinkRefused, since, true)
+	want(t, b, "status/link_state", "refused")
+	want(t, b, "status/link_since", "2026-11-09T16:00:00Z")
+	want(t, b, "status/power_cycle_needed", "true")
 }
 
 func TestFailedPublishIsRetried(t *testing.T) {
@@ -210,41 +265,30 @@ func TestFailedPublishIsRetried(t *testing.T) {
 	}
 }
 
-func TestPollEndpointSelection(t *testing.T) {
-	var activeCode atomic.Int32
-	activeCode.Store(200)
-	srv, cfg, auth, q := newAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if c := int(activeCode.Load()); strings.HasSuffix(r.URL.Path, "/active/options") && c != 200 {
-			w.WriteHeader(c)
-			return
-		}
-		fmt.Fprint(w, `{"data":{"options":[{"key":"Cooking.Hob.Option.ZoneSelector","value":"Cooking.Hob.EnumType.ZoneSelector.FrontLeft"}]}}`)
-	})
-	b := NewBridge(cfg, NewAPIClient(cfg, auth, q), quietLogger(), "HAID")
-	b.out = io.Discard
-	b.applyKV("BSH.Common.Setting.PowerState", "BSH.Common.EnumType.PowerState.On")
-
-	b.applyKV("BSH.Common.Status.OperationState", "BSH.Common.EnumType.OperationState.Ready")
-	b.PollActiveOptions(context.Background())
-	b.applyKV("BSH.Common.Status.OperationState", "BSH.Common.EnumType.OperationState.Run")
-	b.PollActiveOptions(context.Background())
-	activeCode.Store(404)
-	b.PollActiveOptions(context.Background())
-
-	got := srv.Paths()
-	want := []string{"selected/options", "active/options", "active/options", "selected/options"}
-	if len(got) != len(want) {
-		t.Fatalf("paths %v, want suffixes %v", got, want)
-	}
-	for i := range want {
-		if !strings.HasSuffix(got[i], want[i]) {
-			t.Fatalf("request %d = %s, want .../%s (all: %v)", i, got[i], want[i], got)
+func TestLabels(t *testing.T) {
+	power := map[string]string{"Off": "off", "10": "1", "15": "1.5", "45": "4.5", "90": "9", "KeepWarm": "KeepWarm", "Boost1": "Boost1"}
+	for in, out := range power {
+		if got := powerLevelAPIToLabel(in); got != out {
+			t.Errorf("power %q = %q, want %q", in, got, out)
 		}
 	}
-
-	b.ApplyEvent(SSEEvent{Event: "DISCONNECTED"})
-	b.PollActiveOptions(context.Background())
-	if n := len(srv.Paths()); n != len(want) {
-		t.Fatalf("polled a disconnected appliance (%d requests)", n)
+	fan := map[string]string{"Off": "off", "Automatic": "auto", "Level01": "1", "Level02": "1.5", "Level08": "4.5", "Level15": "8", "Level17": "9",
+		"BoostLevel1": "boost1", "BoostLevel2": "boost2", "AfterRun": "afterrun", "Mystery": "mystery"}
+	for in, out := range fan {
+		if got := fanLabel(in); got != out {
+			t.Errorf("fan %q = %q, want %q", in, got, out)
+		}
+	}
+	if got := fanLabel(42.0); got != "42" {
+		t.Errorf("unknown numeric fan value = %q", got)
+	}
+	states := []struct{ state, op, want string }{
+		{"Active", "Run", "active"}, {"Off", "Ready", "off"}, {"ResiduelHeat", "", "residual_heat"},
+		{"NotSelectable", "", "not_selectable"}, {"Active", "Pause", "paused"}, {"Off", "Error", "error"}, {"", "", "off"},
+	}
+	for _, s := range states {
+		if got := zoneStateLabel(s.state, s.op); got != s.want {
+			t.Errorf("zoneStateLabel(%q, %q) = %q, want %q", s.state, s.op, got, s.want)
+		}
 	}
 }

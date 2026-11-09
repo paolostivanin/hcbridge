@@ -4,105 +4,82 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+
+	hc "hcbridge/internal/homeconnect"
 )
-
-// Zones in API enum order. Bosch's API only ever returns one zone at a time
-// (whichever the panel last focused), so we maintain a "last observed" map
-// to give HA a per-zone view that updates as the user touches each zone.
-var allZones = []string{"FrontLeft", "FrontRight", "RearLeft", "RearRight"}
-
-// runningStates are the OperationStates in which /programs/active exists.
-// In any other state /active only answers 404, so the poll goes straight to
-// /programs/selected (one call instead of a 404 plus a fallback).
-var runningStates = map[string]bool{"Run": true, "Pause": true, "ActionRequired": true, "DelayedStart": true}
 
 const publishTimeout = 30 * time.Second
 
+// carbonReplaceAt is the saturation (percent) from which the carbon filter
+// is flagged for replacement. The hob's own "nearly saturated" event was
+// seen at 96%; the event also latches the flag.
+const carbonReplaceAt = 90
+
+// zoneObs is the last reported state of one cooking zone.
+type zoneObs struct {
+	state string // State member: Off, Active, ResiduelHeat, NotSelectable
+	op    string // OperationState member: Ready, Run, Pause, Finished, ...
+	power string // power label: off, 1, 1.5, ..., Boost1
+}
+
+// Bridge turns resolved appliance values into MQTT publishes and owns the
+// MQTT connection. Values arrive in wire order from one goroutine (the
+// client's event dispatcher); the MQTT callbacks run on paho's goroutines.
 type Bridge struct {
-	cfg  *Config
-	api  *APIClient
-	log  *Logger
-	cli  mqtt.Client
-	haID string
-	out  io.Writer // dry-run sink when cli is nil (--mode=watch, tests)
+	cfg *Config
+	log *Logger
+	cli mqtt.Client
+	out io.Writer // dry-run sink when cli is nil (local-watch, tests)
 
 	mu sync.Mutex
-	// lastPub is the desired retained state: topic suffix → payload. It is
+	// lastPub is the desired retained state: topic suffix -> payload. It is
 	// republished in full on every broker (re)connect, so state published
 	// while the broker was away or lost by a broker restart is restored.
 	lastPub map[string]string
 	// failed marks suffixes whose last publish did not complete, so the
 	// next identical publish is not swallowed by the dedup.
-	failed       map[string]bool
-	zoneState    map[string]string // zone name → power label ("off", "1", "1.5", ...)
-	joinedLeft   bool
-	joinedRight  bool
-	eventAt      map[string]time.Time // key → when an SSE event last set it
-	lastDeadline time.Time            // last published program timer deadline
-	unmapped     map[string]bool      // unmapped keys already logged
+	failed        map[string]bool
+	lastAt        map[string]time.Time // when each suffix was last published (throttling)
+	deadlines     map[string]time.Time // last published timer deadline per suffix
+	unmapped      map[string]bool      // unmapped keys already logged
+	zones         map[string]*zoneObs  // by zone name (FrontLeft, ...)
+	selector      string               // the zone the panel has focus on
+	joinFlag      map[string]bool      // "left"/"right": last JoinZone reported for that side
+	carbonSat     float64
+	carbonKnown   bool
+	carbonLatched bool
+	meta          deviceMeta
 
-	// applyMu serialises applyOptions against resetZones so their publishes
-	// cannot interleave. zoneEpoch is bumped by every resetZones; a poll
-	// captures it before its GET and drops the result if it moved, so a poll
-	// that was in flight when the hob switched off cannot relight the zone
-	// tiles.
-	applyMu   sync.Mutex
-	zoneEpoch atomic.Uint64
-
-	applianceOnline atomic.Bool
+	discoveryMu sync.Mutex
 }
 
-func NewBridge(cfg *Config, api *APIClient, log *Logger, haID string) *Bridge {
+func NewBridge(cfg *Config, meta deviceMeta, log *Logger) *Bridge {
 	b := &Bridge{
 		cfg:       cfg,
-		api:       api,
 		log:       log,
-		haID:      haID,
 		out:       os.Stdout,
 		lastPub:   map[string]string{},
 		failed:    map[string]bool{},
-		zoneState: map[string]string{},
-		eventAt:   map[string]time.Time{},
+		lastAt:    map[string]time.Time{},
+		deadlines: map[string]time.Time{},
 		unmapped:  map[string]bool{},
+		zones:     map[string]*zoneObs{},
+		joinFlag:  map[string]bool{},
+		meta:      meta,
 	}
 	for _, z := range allZones {
-		b.zoneState[z] = "off"
+		b.zones[z] = &zoneObs{}
 	}
-	b.applianceOnline.Store(true) // until the API says otherwise
 	return b
-}
-
-// IsHobActive returns true when the hob is powered on. Standby does not
-// count: no zone can be cooking, so polling it would only spend quota.
-func (b *Bridge) IsHobActive() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.lastPub["status/power_state"] == "On"
-}
-
-// CanPoll reports whether a per-zone options poll is worth its call: the hob
-// is on and connected. While the appliance is disconnected every poll only
-// earns a 409, and those count towards Bosch's successive-error limit.
-func (b *Bridge) CanPoll() bool {
-	return b.applianceOnline.Load() && b.IsHobActive()
-}
-
-func (b *Bridge) programRunning() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.lastPub["status/operation_state"]
-	return !ok || s == "" || runningStates[s] // unknown: try /active first
 }
 
 func (b *Bridge) Connect(ctx context.Context) error {
@@ -162,9 +139,7 @@ func (b *Bridge) onConnect(_ mqtt.Client) {
 	b.log.Info("MQTT connected to %s:%d", b.cfg.MQTT.Host, b.cfg.MQTT.Port)
 	b.publish("connected", "online")
 
-	if err := PublishDiscovery(b.cfg, b.cli, b.log); err != nil {
-		b.log.Error("publish discovery: %v", err)
-	}
+	b.publishDiscovery()
 	b.clearRemoved()
 
 	// Republish the whole desired state: anything published while the
@@ -181,9 +156,17 @@ func (b *Bridge) onConnect(_ mqtt.Client) {
 	}
 }
 
+func (b *Bridge) publishDiscovery() {
+	b.discoveryMu.Lock()
+	defer b.discoveryMu.Unlock()
+	if err := PublishDiscovery(b.cfg, b.Meta(), b.cli, b.log); err != nil {
+		b.log.Error("publish discovery: %v", err)
+	}
+}
+
 // clearRemoved publishes empty retained payloads to the discovery and state
-// topics of entities removed in 2.0.0, which deletes them from HA and from
-// the broker. Idempotent, so it simply runs on every connect.
+// topics of entities earlier versions published, which deletes them from HA
+// and from the broker. Idempotent, so it simply runs on every connect.
 func (b *Bridge) clearRemoved() {
 	for _, d := range removedDiscovery {
 		b.send(discoveryTopic(b.cfg, d.component, d.objectID), "", true, nil)
@@ -210,10 +193,26 @@ func (b *Bridge) publish(suffix, payload string) bool {
 		return false
 	}
 	b.lastPub[suffix] = payload
+	b.lastAt[suffix] = time.Now()
 	delete(b.failed, suffix)
 	b.mu.Unlock()
 	b.send(b.cfg.StateTopic(suffix), payload, true, b.onFail(suffix, payload))
 	return true
+}
+
+// publishThrottled is publish with the rate limit of throttledSuffixes.
+func (b *Bridge) publishThrottled(suffix, payload string) bool {
+	if gap, ok := throttledSuffixes[suffix]; ok {
+		b.mu.Lock()
+		prev, had := b.lastPub[suffix]
+		last := b.lastAt[suffix]
+		b.mu.Unlock()
+		zeroEdge := prev == "0" || payload == "0" || prev == "" || payload == ""
+		if had && prev != payload && !zeroEdge && time.Since(last) < gap {
+			return false
+		}
+	}
+	return b.publish(suffix, payload)
 }
 
 func (b *Bridge) onFail(suffix, payload string) func() {
@@ -257,270 +256,212 @@ func (b *Bridge) send(topic, payload string, retained bool, onFail func()) {
 	}()
 }
 
-// ApplyEvent translates an SSE event to MQTT publishes.
-func (b *Bridge) ApplyEvent(ev SSEEvent) {
-	switch ev.Event {
-	case "CONNECTED":
-		// The appliance came back online (the counterpart of DISCONNECTED;
-		// the bridge's own availability is the LWT-backed "connected" topic).
-		b.SetApplianceOnline(true)
-		return
-	case "DISCONNECTED":
-		b.SetApplianceOnline(false)
-		return
-	case "PAIRED", "DEPAIRED", "STREAM_UP", "STREAM_DOWN":
-		return // the controller handles the stream events
-	}
-	now := time.Now()
-	b.mu.Lock()
-	for _, it := range ev.Items {
-		b.eventAt[it.Key] = now
-	}
-	b.mu.Unlock()
-	for _, it := range ev.Items {
-		b.applyKV(it.Key, it.Value)
-	}
-}
-
-func (b *Bridge) SetApplianceOnline(online bool) {
-	b.applianceOnline.Store(online)
-	b.publish("status/appliance_online", strconv.FormatBool(online))
-}
-
-// ApplySnapshot applies a /status + /settings snapshot taken at startedAt.
-// Keys an SSE event set after startedAt are skipped: the snapshot is older
-// than the event, and applying it would e.g. turn a fresh PowerState=On back
-// into Off and stop polling for the whole session.
-func (b *Bridge) ApplySnapshot(kv map[string]interface{}, online bool, startedAt time.Time) {
-	b.SetApplianceOnline(online)
-	for k, v := range kv {
-		b.mu.Lock()
-		newer := b.eventAt[k].After(startedAt)
-		b.mu.Unlock()
-		if newer {
-			b.log.Debug("snapshot: keeping newer event value for %s", k)
+// ApplyValues publishes a batch of values pushed by the hob. snapshot marks
+// the full /ro/allMandatoryValues read after each (re)connect: it carries
+// every event's resting state, which must not fire event topics.
+func (b *Bridge) ApplyValues(vals []hc.Value, snapshot bool) {
+	for _, v := range vals {
+		if !v.Known() {
+			b.logUnmapped(fmt.Sprintf("uid %d", v.UID), string(v.Raw), false)
 			continue
 		}
-		b.applyKV(k, v)
+		b.applyKV(v.Name, v.Display(), snapshot)
 	}
 }
 
-func (b *Bridge) applyKV(key string, value interface{}) {
+// ApplyDescriptions applies the values that arrive inside access changes.
+// Some values only ever come this way: the carbon filter saturation, for
+// one, is not readable while the hob is off and shows up as the value of
+// the access change at power-on.
+func (b *Bridge) ApplyDescriptions(ds []hc.Description) {
+	for _, d := range ds {
+		if d.Value == nil || d.Name == "" {
+			continue
+		}
+		if _, isEvent := eventKeyToSuffix[d.Name]; isEvent {
+			continue
+		}
+		b.applyKV(d.Name, d.Value.Display(), false)
+	}
+}
+
+func (b *Bridge) logUnmapped(key string, value interface{}, ignored bool) {
+	b.mu.Lock()
+	first := !b.unmapped[key]
+	b.unmapped[key] = true
+	b.mu.Unlock()
+	if first && !ignored {
+		b.log.Info("unmapped key %s = %v (logged once)", key, value)
+	} else {
+		b.log.Debug("unmapped key %s = %v", key, value)
+	}
+}
+
+func (b *Bridge) applyKV(key string, value interface{}, snapshot bool) {
 	if suffix, ok := eventKeyToSuffix[key]; ok {
-		// One-shot events: non-retained payload is the EventPresentState
-		// ("Present" / "Confirmed" / "Off"). We publish the cleaned enum.
-		// Bypass dedup so back-to-back identical events both fire.
-		b.send(b.cfg.StateTopic(suffix), formatValue(key, value), false, nil)
+		if snapshot {
+			return
+		}
+		state := cleanEnum(value)
+		b.send(b.cfg.StateTopic(suffix), state, false, nil)
+		if strings.HasPrefix(key, "Cooking.Hob.Event.CarbonFilter") && state == "Present" {
+			b.mu.Lock()
+			b.carbonLatched = true
+			b.mu.Unlock()
+			b.updateCarbon()
+		}
+		return
+	}
+	if m := zoneKeyRe.FindStringSubmatch(key); m != nil {
+		b.applyZone(m[1], m[2], value)
 		return
 	}
 
-	// Bosch's API only ever exposes one RemainingProgramTime — the active
-	// program's, which the physical panel may apply to one of several zones
-	// but is reported as a single value at the program level. It is
-	// published only as a wall-clock deadline so HA can render a live
-	// countdown.
-	if key == "BSH.Common.Option.RemainingProgramTime" {
-		if secs, err := strconv.Atoi(formatValue(key, value)); err == nil {
-			b.updateProgramTimer(secs)
+	switch key {
+	case "BSH.Common.Option.RemainingProgramTime":
+		// Published only as a wall-clock deadline so HA renders a live
+		// countdown; the hob pushes the remaining seconds every second.
+		if secs, ok := value.(float64); ok {
+			b.updateDeadline("status/program_timer_deadline", int(secs))
 		}
 		return
+	case "Cooking.Hob.Option.ZoneSelector":
+		zone := cleanEnum(value)
+		b.mu.Lock()
+		b.selector = zone
+		b.mu.Unlock()
+	case "Cooking.Hob.Option.JoinZone":
+		// The flag describes the focused zone's side; ZoneSelector arrives
+		// before it whenever the focus moves.
+		joined, ok := value.(bool)
+		if !ok {
+			return
+		}
+		b.mu.Lock()
+		side := sideOf(b.selector)
+		if side != "" {
+			b.joinFlag[side] = joined
+		}
+		b.mu.Unlock()
+		b.publishJoins()
+		return
+	case "Cooking.Hob.Status.CarbonFilterSaturation":
+		if pct, ok := value.(float64); ok {
+			b.mu.Lock()
+			b.carbonSat, b.carbonKnown = pct, true
+			b.mu.Unlock()
+			b.updateCarbon()
+		}
 	}
 
 	suffix, ok := keyToSuffix[key]
 	if !ok {
-		b.mu.Lock()
-		first := !b.unmapped[key]
-		b.unmapped[key] = true
-		b.mu.Unlock()
-		if first && !ignoredKeys[key] {
-			b.log.Info("unmapped key %s = %v (logged once)", key, value)
-		} else {
-			b.log.Debug("unmapped key %s = %v", key, value)
-		}
+		b.logUnmapped(key, value, isIgnored(key))
 		return
 	}
 	payload := formatValue(key, value)
-	b.publish(suffix, payload)
+	b.publishThrottled(suffix, payload)
 
-	// Hob power down → all zones are off. Reset our tracking map so the HA
-	// per-zone tiles don't keep showing stale "last observed" values forever.
 	if key == "BSH.Common.Setting.PowerState" && payload == "Off" {
-		b.resetZones()
+		b.resetOnPowerOff()
 	}
 }
 
-// PollActiveOptions fetches the program options, updates the per-zone state
-// map for whichever zone is currently focused, and refreshes the program
-// timer. One API call: /programs/active/options while a program runs, else
-// /programs/selected/options; two only when /active unexpectedly 404s.
-// Reports whether any published value changed.
-func (b *Bridge) PollActiveOptions(ctx context.Context) bool {
-	if !b.CanPoll() {
-		return false
+// applyZone handles Cooking.Hob.Status.Zone.<id>.<attr>.
+func (b *Bridge) applyZone(id, attr string, value interface{}) {
+	zone, ok := zoneHalves[id]
+	if !ok {
+		b.logUnmapped("Cooking.Hob.Status.Zone."+id+"."+attr, value, true)
+		return
 	}
-	epoch := b.zoneEpoch.Load()
-	base := "/api/homeappliances/" + b.haID + "/programs/"
-	fromActive := b.programRunning()
-	var body []byte
-	var code int
-	var err error
-	if fromActive {
-		body, code, err = b.api.RawGET(ctx, base+"active/options")
-		if err != nil {
-			b.log.Debug("PollActiveOptions: %v", err)
-			return false
+	slug := zoneSlug(zone)
+	switch attr {
+	case "PowerLevel":
+		power := formatValue(".PowerLevel", value)
+		if power == "" {
+			power = "off"
 		}
-	}
-	if !fromActive || code == 404 {
-		// No running program (e.g. a per-zone timer just expired and
-		// OperationState went to Ready) but the hob is still powered on.
-		// Bosch keeps the post-expiry zone state in /programs/selected/options
-		// — same option shape, with PowerLevel updated to Off — so it
-		// surfaces zone-off promptly instead of waiting for the next touch.
-		fromActive = false
-		body, code, err = b.api.RawGET(ctx, base+"selected/options")
-		if err != nil {
-			b.log.Debug("PollActiveOptions selected: %v", err)
-			return false
+		b.mu.Lock()
+		b.zones[zone].power = power
+		b.mu.Unlock()
+		b.publish("zone/"+slug+"/power", power)
+	case "State", "OperationState":
+		s := cleanEnum(value)
+		b.mu.Lock()
+		z := b.zones[zone]
+		if attr == "State" {
+			z.state = s
+		} else {
+			z.op = s
 		}
+		label := zoneStateLabel(z.state, z.op)
+		b.mu.Unlock()
+		b.publish("zone/"+slug+"/state", label)
+		b.publishJoins()
+	case "RemainingProgramTime":
+		if secs, ok := value.(float64); ok {
+			b.updateDeadline("zone/"+slug+"/timer_deadline", int(secs))
+		}
+	default:
+		// Duration, elapsed time, progress, programs, sensor levels, shape:
+		// known, not published.
 	}
-	if code != 200 {
-		return false
-	}
-	var resp optionsListResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		b.log.Warn("PollActiveOptions parse: %v", err)
-		return false
-	}
-	return b.applyOptions(resp.Data.Items, fromActive, epoch)
 }
 
-// applyOptions publishes one /programs/{active,selected}/options response.
-// The focused zone is published here as well as the per-zone map: SSE never
-// carries ZoneSelector/PowerLevel/JoinZone. Program-level options (duration,
-// elapsed, progress, remaining) are taken from /active only; /selected
-// describes a program that is not running, so only its zone state and timer
-// are used. epoch is zoneEpoch as read before the GET; the result is dropped
-// if the zones were reset since, or if the hob is no longer on.
-func (b *Bridge) applyOptions(items []apiKV, fromActive bool, epoch uint64) bool {
-	b.applyMu.Lock()
-	defer b.applyMu.Unlock()
-	if b.zoneEpoch.Load() != epoch || !b.IsHobActive() {
-		b.log.Debug("options result dropped: hob switched off while the poll was in flight")
-		return false
+func sideOf(zone string) string {
+	switch zone {
+	case "FrontLeft", "RearLeft":
+		return "left"
+	case "FrontRight", "RearRight":
+		return "right"
 	}
-	changed := false
-	var zone, power string
-	var joined bool
-	var sawJoin bool
-	for _, kv := range items {
-		switch kv.Key {
-		case "Cooking.Hob.Option.ZoneSelector":
-			zone = cleanEnum(kv.Value)
-		case "Cooking.Hob.Option.PowerLevel":
-			power = formatValue(kv.Key, kv.Value)
-		case "Cooking.Hob.Option.JoinZone":
-			if v, ok := kv.Value.(bool); ok {
-				joined, sawJoin = v, true
-			}
-		case "BSH.Common.Option.RemainingProgramTime":
-			if v, ok := kv.Value.(float64); ok {
-				changed = b.updateProgramTimer(int(v)) || changed
-			}
-		case "BSH.Common.Option.Duration",
-			"BSH.Common.Option.ElapsedProgramTime",
-			"BSH.Common.Option.ProgramProgress":
-			if fromActive {
-				changed = b.publish(keyToSuffix[kv.Key], formatValue(kv.Key, kv.Value)) || changed
-			}
-		}
-	}
-	if zone == "" {
-		return changed
-	}
-	if partnerZone(zone) == "" {
-		// Not one of the four known zones (e.g. a null ZoneSelector would
-		// otherwise create a zone/<nil>/power topic).
-		b.log.Debug("options: ignoring unknown zone %q", zone)
-		return changed
-	}
-	if power == "" {
-		power = "off"
-	}
-	changed = b.publish("status/focused_zone", zone) || changed
-	changed = b.updateZone(zone, power, joined, sawJoin) || changed
-	return changed
+	return ""
 }
 
-// updateZone applies one observation of a focused zone to the state map and
-// publishes the per-zone power topic (plus join-side topic when seen). While a
-// pair is flex-joined the focused zone's power is mirrored onto its partner —
-// Home Connect only ever reports the focused half, so without this the other
-// half's per-zone tile stays stale at "off". On the join→unjoin transition the
-// partner is dropped back to off (it self-corrects on its next focus).
-func (b *Bridge) updateZone(zone, power string, joined, sawJoin bool) bool {
+// publishJoins publishes the flex-join state of both sides. A side counts as
+// joined while the hob's JoinZone flag for it is set and both of its zones
+// are active, so a stale flag cannot outlive the joined cooking.
+func (b *Bridge) publishJoins() {
 	b.mu.Lock()
-	b.zoneState[zone] = power
-	var wasJoined bool
-	if sawJoin {
-		switch zone {
-		case "FrontLeft", "RearLeft":
-			wasJoined, b.joinedLeft = b.joinedLeft, joined
-		case "FrontRight", "RearRight":
-			wasJoined, b.joinedRight = b.joinedRight, joined
-		}
-	}
-	// Mirror power across the flex-joined pair (clear it on un-join). The reset
-	// keys off the *previous* join state, not merely joined==false, so an
-	// independent (never-joined) zone is never zeroed during normal use.
-	partner, partnerPower := "", ""
-	if sawJoin {
-		if p := partnerZone(zone); p != "" {
-			if joined {
-				partner, partnerPower = p, power
-			} else if wasJoined {
-				partner, partnerPower = p, "off"
-			}
-		}
-	}
-	if partner != "" {
-		b.zoneState[partner] = partnerPower
-	}
-	jl, jr := b.joinedLeft, b.joinedRight
+	left := b.joinFlag["left"] && b.zones["FrontLeft"].state == "Active" && b.zones["RearLeft"].state == "Active"
+	right := b.joinFlag["right"] && b.zones["FrontRight"].state == "Active" && b.zones["RearRight"].state == "Active"
 	b.mu.Unlock()
-
-	changed := b.publish("zone/"+zoneSlug(zone)+"/power", power)
-	if partner != "" {
-		changed = b.publish("zone/"+zoneSlug(partner)+"/power", partnerPower) || changed
-	}
-	if sawJoin {
-		switch zone {
-		case "FrontLeft", "RearLeft":
-			changed = b.publish("joined_left", strconv.FormatBool(jl)) || changed
-		case "FrontRight", "RearRight":
-			changed = b.publish("joined_right", strconv.FormatBool(jr)) || changed
-		}
-	}
-	return changed
+	b.publish("joined_left", strconv.FormatBool(left))
+	b.publish("joined_right", strconv.FormatBool(right))
 }
 
-// timerJitter is how far the computed deadline may drift before it is
-// republished. RemainingProgramTime is pushed several times a minute, and
+// updateCarbon publishes the filter-replacement flag: on from carbonReplaceAt
+// percent or after the hob's own saturation event, off again once the
+// saturation reads low (a fresh filter was fitted and the warning reset).
+func (b *Bridge) updateCarbon() {
+	b.mu.Lock()
+	if b.carbonKnown && b.carbonSat < 50 {
+		b.carbonLatched = false
+	}
+	known := b.carbonKnown || b.carbonLatched
+	replace := b.carbonLatched || (b.carbonKnown && b.carbonSat >= carbonReplaceAt)
+	b.mu.Unlock()
+	if known {
+		b.publish("status/carbon_filter_replace", strconv.FormatBool(replace))
+	}
+}
+
+// timerJitter is how far a computed deadline may drift before it is
+// republished. Remaining times are pushed every second, and
 // now+remaining wobbles by about a second each time; republishing every
-// wobble only churned the recorder.
+// wobble only churns the recorder.
 const timerJitter = 2 * time.Second
 
-// updateProgramTimer converts the API's RemainingProgramTime (seconds) into
-// an RFC3339 wall-clock deadline and publishes it. Empty string when no timer
-// is active (remaining <= 0) so HA renders the entity as "unknown" rather
-// than a stale past timestamp.
-func (b *Bridge) updateProgramTimer(remainingSecs int) bool {
+// updateDeadline converts a remaining time (seconds) into an RFC3339
+// wall-clock deadline and publishes it to suffix. Empty when no timer runs
+// (remaining <= 0), so HA renders "unknown" instead of a stale timestamp.
+func (b *Bridge) updateDeadline(suffix string, remainingSecs int) bool {
 	var deadline time.Time
 	if remainingSecs > 0 {
 		deadline = time.Now().Add(time.Duration(remainingSecs) * time.Second)
 	}
 	b.mu.Lock()
-	prev := b.lastDeadline
+	prev := b.deadlines[suffix]
 	if !deadline.IsZero() && !prev.IsZero() {
 		d := deadline.Sub(prev)
 		if d < timerJitter && d > -timerJitter {
@@ -528,62 +469,77 @@ func (b *Bridge) updateProgramTimer(remainingSecs int) bool {
 			return false
 		}
 	}
-	b.lastDeadline = deadline
+	b.deadlines[suffix] = deadline
 	b.mu.Unlock()
-	return b.publish("status/program_timer_deadline", formatDeadline(deadline))
+	return b.publish(suffix, formatDeadline(deadline))
 }
 
-// resetZones marks all zones off, clears the program timer, and republishes.
-// Triggered on PowerState=Off — when the hob loses power, no zone is active
-// and no timer is running. Callers must not hold applyMu (applyOptions never
-// reaches here: it does not forward PowerState).
-func (b *Bridge) resetZones() {
-	b.applyMu.Lock()
-	defer b.applyMu.Unlock()
-	b.zoneEpoch.Add(1)
+// resetOnPowerOff: once the hob is off no zone heats, no timer runs and no
+// pair is joined. The hob pushes most of this itself; resetting here covers
+// a missed push. Residual heat is kept: the hob reports it after power-off.
+func (b *Bridge) resetOnPowerOff() {
 	b.mu.Lock()
-	for _, z := range allZones {
-		b.zoneState[z] = "off"
+	for _, z := range b.zones {
+		z.power = "off"
+		if z.state == "Active" {
+			z.state = "Off"
+		}
+		z.op = ""
 	}
-	b.joinedLeft = false
-	b.joinedRight = false
-	b.lastDeadline = time.Time{}
+	b.joinFlag = map[string]bool{}
+	labels := map[string]string{}
+	for name, z := range b.zones {
+		labels[name] = zoneStateLabel(z.state, z.op)
+	}
 	b.mu.Unlock()
 	for _, z := range allZones {
-		b.publish("zone/"+zoneSlug(z)+"/power", "off")
+		slug := zoneSlug(z)
+		b.publish("zone/"+slug+"/power", "off")
+		b.publish("zone/"+slug+"/state", labels[z])
+		b.updateDeadline("zone/"+slug+"/timer_deadline", 0)
 	}
-	b.publish("joined_left", "false")
-	b.publish("joined_right", "false")
-	b.publish("status/program_timer_deadline", "")
+	b.updateDeadline("status/program_timer_deadline", 0)
+	b.publishJoins()
 }
 
-// PublishRateLimit publishes the current Bosch API rate-limit state to MQTT.
-// Driven by a ticker in the controller; publish() dedups so only transitions
-// generate broker traffic. Empty until-timestamp when not blocked, so the
-// HA timestamp sensor renders "unknown" rather than a stale past value.
-func (b *Bridge) PublishRateLimit(blocked bool, until time.Time) {
-	b.publish("status/rate_limited", strconv.FormatBool(blocked))
-	if blocked {
-		b.publish("status/rate_limited_until", formatDeadline(until))
-	} else {
-		b.publish("status/rate_limited_until", "")
-	}
+// PublishLink publishes the local link's health. These topics are not gated
+// by the link itself: they must stay visible exactly when it is down.
+func (b *Bridge) PublishLink(state hc.LinkState, since time.Time, powerCycleNeeded bool) {
+	b.publish("status/link_state", string(state))
+	b.publish("status/link_since", formatDeadline(since))
+	b.publish("status/power_cycle_needed", strconv.FormatBool(powerCycleNeeded))
 }
 
-// PublishAPICalls publishes the bridge's own rolling 24 h API call count.
-func (b *Bridge) PublishAPICalls(n int) {
-	b.publish("status/api_calls_24h", strconv.Itoa(n))
-}
-
-// SetCloud publishes whether the bridge currently has a live event stream.
+// SetLink publishes whether the bridge has a live session with the hob.
 // Data entities use it as a second availability topic, so HA shows them as
 // unavailable instead of silently frozen while the bridge is blind.
-func (b *Bridge) SetCloud(online bool) {
+func (b *Bridge) SetLink(online bool) {
 	v := "offline"
 	if online {
 		v = "online"
 	}
-	b.publish("cloud", v)
+	b.publish("link", v)
+}
+
+// Meta returns the current device info.
+func (b *Bridge) Meta() deviceMeta {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.meta
+}
+
+// SetDeviceInfo records what the handshake reported. When the firmware
+// versions change the discovery configs are republished so HA's device page
+// shows them; reports whether anything changed.
+func (b *Bridge) SetDeviceInfo(m deviceMeta) bool {
+	b.mu.Lock()
+	changed := !b.meta.sameVersions(m) || b.meta.VIB != m.VIB || b.meta.Serial != m.Serial || b.meta.Brand != m.Brand
+	b.meta = m
+	b.mu.Unlock()
+	if changed && b.cli != nil && b.cli.IsConnected() {
+		go b.publishDiscovery()
+	}
+	return changed
 }
 
 // PublishHeartbeat publishes the main loop's liveness timestamp. The LWT only
@@ -602,7 +558,7 @@ func formatDeadline(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-// zoneSlug converts API zone name to topic slug: "FrontLeft" → "front_left".
+// zoneSlug converts a zone name to its topic slug: "FrontLeft" -> "front_left".
 func zoneSlug(zone string) string {
 	var out strings.Builder
 	for i, r := range zone {
@@ -615,20 +571,4 @@ func zoneSlug(zone string) string {
 		out.WriteRune(r)
 	}
 	return out.String()
-}
-
-// partnerZone returns the other half of a zone's flex-induction pair, or ""
-// if the zone has no partner (or is not a known zone).
-func partnerZone(zone string) string {
-	switch zone {
-	case "FrontLeft":
-		return "RearLeft"
-	case "RearLeft":
-		return "FrontLeft"
-	case "FrontRight":
-		return "RearRight"
-	case "RearRight":
-		return "FrontRight"
-	}
-	return ""
 }

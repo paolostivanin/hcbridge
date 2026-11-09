@@ -2,43 +2,119 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// API ↔ MQTT topic suffix mapping for STATE keys (status/setting/option).
-// State topics are retained. Keys not listed here are dropped; the first
-// sighting of each is logged at INFO so new keys the hob sends get noticed.
+// Local feature name -> MQTT topic suffix for plain state values (retained).
+// Feature names come from the hob's profile; values arrive already resolved
+// to enum member names. Keys not mapped anywhere below are dropped, the
+// first sighting of each logged at INFO so new keys get noticed.
 var keyToSuffix = map[string]string{
-	"BSH.Common.Status.OperationState":     "status/operation_state",
-	"BSH.Common.Status.LocalControlActive": "status/local_control",
-	"BSH.Common.Setting.PowerState":        "status/power_state",
-	"BSH.Common.Setting.ChildLock":         "status/child_lock",
-	"BSH.Common.Option.Duration":           "status/program_duration",
-	"BSH.Common.Option.ElapsedProgramTime": "status/elapsed_program_time",
-	"BSH.Common.Option.ProgramProgress":    "status/program_progress",
-	"BSH.Common.Root.ActiveProgram":        "status/active_program",
-
-	// Per-zone state comes from /programs/{active,selected}/options. The
-	// hob exposes only one zone at a time — whichever the panel last
-	// focused — and Bosch does not push it via SSE; it is refreshed on every
-	// options poll (Bridge.applyOptions). Listed here in case an SSE event
-	// ever does carry it.
-	"Cooking.Hob.Option.ZoneSelector": "status/focused_zone",
+	"BSH.Common.Status.OperationState":          "status/operation_state",
+	"BSH.Common.Status.LocalControlActive":      "status/local_control",
+	"BSH.Common.Setting.PowerState":             "status/power_state",
+	"BSH.Common.Setting.ChildLock":              "status/child_lock",
+	"BSH.Common.Option.Duration":                "status/program_duration",
+	"BSH.Common.Option.ElapsedProgramTime":      "status/elapsed_program_time",
+	"BSH.Common.Option.ProgramProgress":         "status/program_progress",
+	"BSH.Common.Root.ActiveProgram":             "status/active_program",
+	"Cooking.Hob.Option.ZoneSelector":           "status/focused_zone",
+	"Cooking.Hob.Setting.Ventilation":           "status/fan_level",
+	"Cooking.Hob.Status.CarbonFilterSaturation": "status/carbon_filter_saturation",
+	"BSH.Common.Status.WiFiSignalStrength":      "status/wifi_signal",
+	"BSH.Common.Status.BackendConnected":        "status/backend_connected",
 }
 
-// Keys deliberately dropped since 2.0.0 (their entities were removed as
-// unused). Logged at DEBUG, not as "new" keys.
+// throttledSuffixes are published at most this often while they change.
+// The hob pushes elapsed time and progress every second while a program
+// runs; every tick as a retained publish only churns the broker and HA's
+// recorder. A change to or from zero always goes out at once.
+var throttledSuffixes = map[string]time.Duration{
+	"status/elapsed_program_time": 15 * time.Second,
+	"status/program_progress":     15 * time.Second,
+	"status/wifi_signal":          5 * time.Minute,
+}
+
+// One-shot events, published non-retained to event/* so HA automations
+// can trigger on them without re-firing on a restart. The payload is the
+// event state (Present, Confirmed, Off).
+var eventKeyToSuffix = map[string]string{
+	"BSH.Common.Event.AlarmClockElapsed":                       "event/alarm_clock_elapsed",
+	"BSH.Common.Event.ProgramFinished":                         "event/program_finished",
+	"BSH.Common.Event.ProgramAborted":                          "event/program_aborted",
+	"Cooking.Hob.Event.CarbonFilterMaxSaturationNearlyReached": "event/carbon_filter_nearly_saturated",
+	"Cooking.Hob.Event.CarbonFilterMaxSaturationReached":       "event/carbon_filter_saturated",
+}
+
+// Keys the hob pushes that are understood but deliberately not published.
+// Logged at DEBUG, not as new keys.
 var ignoredKeys = map[string]bool{
-	"BSH.Common.Setting.AlarmClock":               true,
-	"BSH.Common.Status.RemoteControlActive":       true,
-	"BSH.Common.Status.RemoteControlStartAllowed": true,
+	"BSH.Common.Root.SelectedProgram":                    true,
+	"BSH.Common.Setting.AlarmClock":                      true,
+	"BSH.Common.Setting.AllowBackendConnection":          true,
+	"BSH.Common.Setting.AllowConsumerInsights":           true,
+	"BSH.Common.Setting.TemperatureUnit":                 true,
+	"BSH.Common.Status.RemoteControlActive":              true,
+	"BSH.Common.Status.RemoteControlStartAllowed":        true,
+	"BSH.Common.Status.CustomerServiceConnectionAllowed": true,
+	"BSH.Common.Status.WipeProtectionActive":             true,
+	"BSH.Common.Status.StopWatchState":                   true,
+	"BSH.Common.Status.StopWatchTime":                    true,
+	"BSH.Common.Status.SoftwareUpdateTransactionID":      true,
+	"BSH.Common.Event.ConnectLocalWiFi":                  true,
+	"BSH.Common.Event.CustomerServiceRequest":            true,
+	"BSH.Common.Event.SoftwareDownloadAvailable":         true,
+	"BSH.Common.Event.SoftwareUpdateAvailable":           true,
+	"BSH.Common.Event.SoftwareUpdateSuccessful":          true,
+	"Cooking.Hob.Option.PowerLevel":                      true, // the focused zone's level; zones report their own
+	"Cooking.Hob.Option.CookingSensorLevel":              true,
+	"Cooking.Hob.Option.FryingSensorLevel":               true,
 }
 
-// Retained state topics published by versions before 2.0.0 and no longer
-// used. They are cleared (empty retained payload) on every broker connect so
-// nothing stale lingers on the broker.
+// ignoredPrefixes covers whole families: the hob's configuration settings
+// (buzzer, power management, ...), the cooking sensor, PowerMove.
+var ignoredPrefixes = []string{
+	"Cooking.Hob.Setting.",
+	"Cooking.Hob.Option.PowerMoveMode",
+	"Cooking.Hob.Event.CookingSensor",
+}
+
+func isIgnored(key string) bool {
+	if ignoredKeys[key] {
+		return true
+	}
+	for _, p := range ignoredPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// zoneKeyRe matches per-zone keys: Cooking.Hob.Status.Zone.<id>.<attr>.
+var zoneKeyRe = regexp.MustCompile(`^Cooking\.Hob\.(?:Status|Setting|Option)\.Zone\.(\w+)\.(\w+)$`)
+
+// zoneHalves maps the hob's zone IDs to the four cooking zones. On the
+// PXX801D67E a flex-joined pair is reported as both base zones active at
+// the same level; the combined zones 120/340 and the venting zone F55 in
+// the profile never carry values (observed 2026-11-09).
+var zoneHalves = map[string]string{
+	"100": "FrontLeft",
+	"200": "RearLeft",
+	"300": "RearRight",
+	"400": "FrontRight",
+}
+
+// Zones in topic order.
+var allZones = []string{"FrontLeft", "FrontRight", "RearLeft", "RearRight"}
+
+// Retained state topics published by earlier versions and no longer used.
+// They are cleared (empty retained payload) on every broker connect.
 var removedStateTopics = []string{
+	// gone in the cloud 2.0 rewrite
 	"status/alarm_clock_seconds",
 	"status/alarm_clock_minutes",
 	"status/remaining_program_time",
@@ -46,42 +122,34 @@ var removedStateTopics = []string{
 	"status/focused_zone_joined",
 	"status/remote_start_allowed",
 	"status/remote_control_active",
+	// cloud-only, gone with the local transport
+	"status/rate_limited",
+	"status/rate_limited_until",
+	"status/api_calls_24h",
+	"status/appliance_online",
+	"cloud",
 }
 
-// Note: integrated venting is NOT exposed via the public Home Connect API for
-// PXX801D67E (confirmed via /settings/Cooking.{Hob,Hood,Common}.Setting.* direct
-// probes — all returned 409 UnsupportedSetting). --mode=dump also probes the
-// documented hood program option path.
-
-// EVENT-class keys are one-shot (AlarmClock rang, program finished, etc).
-// These get published non-retained to event/* topics so HA mqtt event
-// triggers can fire on them without re-firing on restart.
-var eventKeyToSuffix = map[string]string{
-	"BSH.Common.Event.AlarmClockElapsed": "event/alarm_clock_elapsed",
-	"BSH.Common.Event.ProgramFinished":   "event/program_finished",
-	"BSH.Common.Event.ProgramAborted":    "event/program_aborted",
-}
-
-// Strip enum prefixes for compact MQTT payloads.
-//
-//	"BSH.Common.EnumType.PowerState.On" -> "On"
-//	"BSH.Common.EnumType.OperationState.Run" -> "Run"
+// cleanEnum strips an enum prefix ("BSH.Common.EnumType.PowerState.On" ->
+// "On"). Local values arrive as bare member names already; this keeps
+// fully qualified names readable too.
 func cleanEnum(v interface{}) string {
 	s, ok := v.(string)
 	if !ok {
 		return fmt.Sprintf("%v", v)
 	}
-	if i := strings.LastIndex(s, "."); i >= 0 {
-		return s[i+1:]
+	if strings.Contains(s, ".EnumType.") {
+		if i := strings.LastIndex(s, "."); i >= 0 {
+			return s[i+1:]
+		}
 	}
 	return s
 }
 
-// powerLevelAPIToLabel converts Cooking.Hob.EnumType.PowerLevel.NN to the
-// displayed level. Bosch encodes the displayed power × 10 (so the panel-
-// shown "1" is API value 10, "1.5" is 15, "9" is 90, etc). "Off" stays "off".
-// Non-numeric levels (e.g. "Boost2") pass through unchanged; the dashboard
-// renders them as-is. The encoding is empirical, not documented.
+// powerLevelAPIToLabel converts a PowerLevel enum member to the displayed
+// level. The hob encodes the displayed power x 10 ("10" is level 1, "15"
+// is 1.5, "90" is 9). "Off" becomes "off"; KeepWarm and Boost1/Boost2 pass
+// through.
 func powerLevelAPIToLabel(v interface{}) string {
 	s, ok := v.(string)
 	if !ok {
@@ -104,29 +172,80 @@ func powerLevelAPIToLabel(v interface{}) string {
 	return strconv.FormatFloat(float64(n)/10, 'f', 1, 64)
 }
 
-// formatValue converts an API value into its MQTT payload string.
-// Booleans become "true"/"false"; numbers plain decimals;
-// PowerLevel enums are demangled (10 → "1", 15 → "1.5").
+// fanLabel converts a Ventilation enum member to a short label: off, auto,
+// 1 .. 9 in half steps (Level01 is 1, Level02 1.5, Level17 9), boost1,
+// boost2, afterrun. Unknown members are lower-cased.
+func fanLabel(v interface{}) string {
+	s, ok := v.(string)
+	if !ok {
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprintf("%v", v)
+	}
+	switch s = cleanEnum(s); s {
+	case "Off":
+		return "off"
+	case "Automatic":
+		return "auto"
+	case "BoostLevel1":
+		return "boost1"
+	case "BoostLevel2":
+		return "boost2"
+	case "AfterRun":
+		return "afterrun"
+	}
+	if n, err := strconv.Atoi(strings.TrimPrefix(s, "Level")); err == nil && strings.HasPrefix(s, "Level") {
+		level := float64(n+1) / 2
+		if level == float64(int(level)) {
+			return strconv.Itoa(int(level))
+		}
+		return strconv.FormatFloat(level, 'f', 1, 64)
+	}
+	return strings.ToLower(s)
+}
+
+// zoneStateLabel combines a zone's State with its OperationState: a paused
+// or failed zone says so, otherwise the heating state.
+func zoneStateLabel(state, op string) string {
+	switch op {
+	case "Pause":
+		return "paused"
+	case "Error":
+		return "error"
+	case "ActionRequired":
+		return "action_required"
+	}
+	switch state {
+	case "Active":
+		return "active"
+	case "ResiduelHeat", "ResidualHeat":
+		return "residual_heat"
+	case "NotSelectable":
+		return "not_selectable"
+	case "Off", "":
+		return "off"
+	}
+	return strings.ToLower(state)
+}
+
+// formatValue converts a resolved value into its MQTT payload string.
 func formatValue(key string, v interface{}) string {
-	if key == "Cooking.Hob.Option.PowerLevel" {
+	switch {
+	case strings.HasSuffix(key, ".PowerLevel"):
 		if lbl := powerLevelAPIToLabel(v); lbl != "" {
 			return lbl
 		}
+	case key == "Cooking.Hob.Setting.Ventilation":
+		return fanLabel(v)
 	}
 	switch x := v.(type) {
 	case nil:
 		return ""
 	case bool:
-		if x {
-			return "true"
-		}
-		return "false"
+		return strconv.FormatBool(x)
 	case string:
-		// Most enum-typed values carry a "BSH.Common.EnumType.X.Foo" string.
-		if strings.Contains(x, ".EnumType.") {
-			return cleanEnum(x)
-		}
-		return x
+		return cleanEnum(x)
 	case float64:
 		if x == float64(int64(x)) {
 			return strconv.FormatInt(int64(x), 10)

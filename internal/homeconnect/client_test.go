@@ -494,3 +494,21 @@ func TestNotBeforeDelaysFirstDial(t *testing.T) {
 		t.Fatalf("dialed %v, not before %v", dialed, nb)
 	}
 }
+
+// A resumed failure episode keeps its state and start time: no
+// "connecting" announcement, and retries in the same state stay silent.
+func TestResumeEpisode(t *testing.T) {
+	srv := newServer(t)
+	srv.Refuse(503, nil, "")
+	since := time.Now().Add(-time.Hour)
+	h := start(t, srv, func(o *hc.Options) { o.Resume = hc.LinkStatus{State: hc.LinkRefused, Since: since} })
+	waitFor(t, 3*time.Second, "a few refused dials", func() bool { return len(srv.DialTimes()) >= 3 })
+	if got := h.rec.linkStates(); len(got) != 0 {
+		t.Fatalf("resumed episode emitted %v", got)
+	}
+	srv.Refuse(0, nil, "")
+	h.rec.waitLink(t, hc.LinkConnected, 1)
+	if !h.log.has("connected after refused for 1h") {
+		t.Fatal("recovery log does not span the resumed episode")
+	}
+}

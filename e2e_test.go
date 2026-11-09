@@ -1,18 +1,16 @@
 //go:build e2e
 
-// End-to-end test against a real MQTT broker and a fake Home Connect API:
+// End-to-end test against a real MQTT broker and a fake hob speaking the
+// local protocol:
 //
 //	docker run --rm -d --name hcb-mqtt -p 127.0.0.1:18831:1883 eclipse-mosquitto mosquitto -c /mosquitto-no-auth.conf
-//	HCBRIDGE_E2E_BROKER=127.0.0.1:18831 go test -tags e2e -run E2E -v ./...
+//	HCBRIDGE_E2E_BROKER=127.0.0.1:18831 go test -tags e2e -race -run E2E -v ./...
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,6 +21,9 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+
+	hc "hcbridge/internal/homeconnect"
+	"hcbridge/internal/homeconnect/hcfake"
 )
 
 type retained struct {
@@ -45,145 +46,124 @@ func TestE2E(t *testing.T) {
 	host, portStr, _ := net.SplitHostPort(broker)
 	port, _ := strconv.Atoi(portStr)
 
-	// --- fake Home Connect API ---------------------------------------------
-	events := make(chan string, 16)
-	var mu sync.Mutex
-	powerOn := true
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		mu.Lock()
-		on := powerOn
-		mu.Unlock()
-		switch {
-		case strings.HasSuffix(p, "/events"):
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(200)
-			w.(http.Flusher).Flush()
-			for {
-				select {
-				case ev := <-events:
-					fmt.Fprint(w, ev)
-					w.(http.Flusher).Flush()
-				case <-r.Context().Done():
-					return
-				}
-			}
-		case strings.HasSuffix(p, "/status"):
-			fmt.Fprint(w, `{"data":{"status":[{"key":"BSH.Common.Status.OperationState","value":"BSH.Common.EnumType.OperationState.Run"},{"key":"BSH.Common.Status.LocalControlActive","value":false}]}}`)
-		case strings.HasSuffix(p, "/settings"):
-			ps := "On"
-			if !on {
-				ps = "Off"
-			}
-			fmt.Fprintf(w, `{"data":{"settings":[{"key":"BSH.Common.Setting.PowerState","value":"BSH.Common.EnumType.PowerState.%s"},{"key":"BSH.Common.Setting.ChildLock","value":false}]}}`, ps)
-		case strings.HasSuffix(p, "/programs/active/options"):
-			fmt.Fprint(w, `{"data":{"options":[
-				{"key":"Cooking.Hob.Option.ZoneSelector","value":"Cooking.Hob.EnumType.ZoneSelector.FrontLeft"},
-				{"key":"Cooking.Hob.Option.PowerLevel","value":"Cooking.Hob.EnumType.PowerLevel.50"},
-				{"key":"Cooking.Hob.Option.JoinZone","value":false},
-				{"key":"BSH.Common.Option.RemainingProgramTime","value":300},
-				{"key":"BSH.Common.Option.Duration","value":600},
-				{"key":"BSH.Common.Option.ElapsedProgramTime","value":300},
-				{"key":"BSH.Common.Option.ProgramProgress","value":50}]}}`)
-		default:
-			w.WriteHeader(404)
-		}
-	}))
-	defer srv.Close()
+	// --- fake hob: on, front-left at 5 with a timer, fan at 4.5 ---------------
+	hob := hcfake.New()
+	defer hob.Close()
+	hob.SetValues(map[int]any{
+		531:  2,  // PowerState On
+		552:  3,  // OperationState Run
+		8202: 2,  // Zone 100 State Active
+		8204: 10, // Zone 100 PowerLevel "50"
+		8209: 300,
+		4409: 18, // Ventilation Level08
+	})
 
-	// --- broker state left by a pre-2.0.0 bridge ------------------------------
+	// --- broker state left by 1.x and the cloud draft -------------------------
 	seed := mqtt.NewClient(mqtt.NewClientOptions().AddBroker("tcp://" + broker).SetClientID("e2e-seed"))
 	if tok := seed.Connect(); !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
 		t.Fatalf("seed connect: %v", tok.Error())
 	}
-	for topic, payload := range map[string]string{
-		"homeassistant/number/hcbridge_cooktop/alarm_clock_minutes/config": `{"name":"old"}`,
-		"homeconnect/cooktop/status/focused_zone_power":                    "5",
-		"homeconnect/cooktop/status/remote_control_active":                 "false",
-	} {
+	stale := map[string]string{
+		"homeassistant/number/hcbridge_cooktop/alarm_clock_minutes/config":        `{"name":"old"}`,
+		"homeassistant/binary_sensor/hcbridge_cooktop/rate_limited/config":        `{"name":"old"}`,
+		"homeassistant/binary_sensor/hcbridge_cooktop/appliance_connected/config": `{"name":"old"}`,
+		"homeconnect/cooktop/status/focused_zone_power":                           "5",
+		"homeconnect/cooktop/status/rate_limited":                                 "false",
+		"homeconnect/cooktop/status/appliance_online":                             "true",
+		"homeconnect/cooktop/cloud":                                               "online",
+	}
+	for topic, payload := range stale {
 		seed.Publish(topic, 1, true, payload).WaitTimeout(5 * time.Second)
 	}
 	seed.Disconnect(100)
 
 	// --- bridge ---------------------------------------------------------------
 	dir := t.TempDir()
-	cfg := testConfig()
-	cfg.apiBase = srv.URL
-	cfg.OAuth.TokenFile = filepath.Join(dir, "token.json")
+	cfg, err := parseConfig([]byte("appliance:\n  host: " + hob.Host() + "\n  profile: /unused\nstate_dir: " + dir + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg.MQTT.Host, cfg.MQTT.Port = host, port
 	cfg.MQTT.ClientID = "hcbridge-e2e"
 	log := NewLogger("", "DEBUG")
-	auth := NewAuthenticator(cfg, log)
-	auth.token = &Token{AccessToken: "x", RefreshToken: "y", ExpiresAt: time.Now().Add(time.Hour)}
-	quota := NewQuota()
-	api := NewAPIClient(cfg, auth, quota)
-	bridge := NewBridge(cfg, api, log, cfg.Appliance.HaID)
+	bridge := NewBridge(cfg, deviceMeta{}, log)
 	if err := bridge.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	done := make(chan struct{})
-	ctl := newController(cfg, api, auth, quota, bridge, log, false)
+	ctl := newController(cfg, hcfake.Profile(), "0a1b2c3d", bridge, log)
+	ctl.offlineGrace = 200 * time.Millisecond
+	ctl.evalEvery = 50 * time.Millisecond
+	ctl.mon.threshold = 500 * time.Millisecond
+	ctl.optsHook = func(o *hc.Options) {
+		o.BackoffMin, o.BackoffMax, o.MinDialGap = 50*time.Millisecond, 200*time.Millisecond, 20*time.Millisecond
+	}
 	go func() { ctl.run(ctx, cancel, sigCh); bridge.Disconnect(); close(done) }()
 
 	// --- observer -------------------------------------------------------------
 	seen := &retained{m: map[string]string{}}
-	observe := func() mqtt.Client {
-		c := mqtt.NewClient(mqtt.NewClientOptions().AddBroker("tcp://" + broker).SetClientID("e2e-obs"))
-		if tok := c.Connect(); !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
-			t.Fatalf("observer connect: %v", tok.Error())
-		}
-		c.SubscribeMultiple(map[string]byte{"homeconnect/#": 1, "homeassistant/+/hcbridge_cooktop/#": 1}, func(_ mqtt.Client, m mqtt.Message) {
-			seen.mu.Lock()
-			if len(m.Payload()) == 0 {
-				delete(seen.m, m.Topic())
-			} else {
-				seen.m[m.Topic()] = string(m.Payload())
-			}
-			seen.mu.Unlock()
-		}).WaitTimeout(5 * time.Second)
-		return c
+	obs := mqtt.NewClient(mqtt.NewClientOptions().AddBroker("tcp://" + broker).SetClientID("e2e-obs"))
+	if tok := obs.Connect(); !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+		t.Fatalf("observer connect: %v", tok.Error())
 	}
-	obs := observe()
 	defer obs.Disconnect(100)
+	obs.SubscribeMultiple(map[string]byte{"homeconnect/#": 1, "homeassistant/+/hcbridge_cooktop/#": 1}, func(_ mqtt.Client, m mqtt.Message) {
+		seen.mu.Lock()
+		if len(m.Payload()) == 0 {
+			delete(seen.m, m.Topic())
+		} else {
+			seen.m[m.Topic()] = string(m.Payload())
+		}
+		seen.mu.Unlock()
+	}).WaitTimeout(5 * time.Second)
 
 	want := func(topic, value string) {
 		t.Helper()
-		ok := waitFor(t, 5*time.Second, func() bool { v, _ := seen.get(topic); return v == value })
-		if !ok {
+		if !waitFor(t, 5*time.Second, func() bool { v, _ := seen.get(topic); return v == value }) {
 			v, present := seen.get(topic)
 			t.Errorf("%s = %q (present=%v), want %q", topic, v, present, value)
 		}
 	}
 
 	want("homeconnect/cooktop/connected", "online")
-	want("homeconnect/cooktop/cloud", "online")
+	want("homeconnect/cooktop/link", "online")
+	want("homeconnect/cooktop/status/link_state", "connected")
+	want("homeconnect/cooktop/status/power_cycle_needed", "false")
 	want("homeconnect/cooktop/status/power_state", "On")
-	want("homeconnect/cooktop/status/focused_zone", "FrontLeft")
+	want("homeconnect/cooktop/status/operation_state", "Run")
 	want("homeconnect/cooktop/zone/front_left/power", "5")
-	want("homeconnect/cooktop/status/program_progress", "50")
-	want("homeconnect/cooktop/status/appliance_online", "true")
-	if v, _ := seen.get("homeconnect/cooktop/status/program_timer_deadline"); v == "" {
-		t.Error("no program timer deadline")
+	want("homeconnect/cooktop/zone/front_left/state", "active")
+	want("homeconnect/cooktop/status/fan_level", "4.5")
+	if v, _ := seen.get("homeconnect/cooktop/zone/front_left/timer_deadline"); v == "" {
+		t.Error("no zone timer deadline")
 	}
 	if v, _ := seen.get("homeconnect/cooktop/status/heartbeat"); v == "" {
 		t.Error("no heartbeat")
 	}
 
-	// Removed entities and topics are gone from the broker.
-	for _, topic := range []string{
-		"homeassistant/number/hcbridge_cooktop/alarm_clock_minutes/config",
-		"homeconnect/cooktop/status/focused_zone_power",
-		"homeconnect/cooktop/status/remote_control_active",
-	} {
+	// Pushes, including a value that arrives inside an access change.
+	hob.Notify(map[int]any{4409: 95})
+	want("homeconnect/cooktop/status/fan_level", "boost1")
+	hob.NotifyDescription(4409, "READ", 101)
+	want("homeconnect/cooktop/status/fan_level", "afterrun")
+
+	// Stale topics and entities from earlier versions are gone.
+	for topic := range stale {
 		if !waitFor(t, 5*time.Second, func() bool { _, ok := seen.get(topic); return !ok }) {
 			v, _ := seen.get(topic)
 			t.Errorf("removed topic %s still retained: %q", topic, v)
 		}
 	}
 
-	// Discovery: every entity, IDs pinned.
+	// Discovery: every entity, IDs pinned, firmware in the device block.
+	if !waitFor(t, 5*time.Second, func() bool {
+		v, _ := seen.get("homeassistant/sensor/hcbridge_cooktop/fan_level/config")
+		return strings.Contains(v, hcfake.SwVersion)
+	}) {
+		t.Error("discovery not republished with the firmware versions")
+	}
 	n := 0
 	seen.mu.Lock()
 	for topic, payload := range seen.m {
@@ -214,30 +194,46 @@ func TestE2E(t *testing.T) {
 	kick.Disconnect(100)
 	want("homeconnect/cooktop/zone/front_left/power", "5")
 
-	// Power off over SSE: zones reset, timer cleared.
-	mu.Lock()
-	powerOn = false
-	mu.Unlock()
-	events <- "event: STATUS\ndata: {\"haId\":\"HAID\",\"items\":[{\"key\":\"BSH.Common.Setting.PowerState\",\"value\":\"BSH.Common.EnumType.PowerState.Off\"}]}\n\n"
+	// Power off: zones and timers reset.
+	hob.Notify(map[int]any{531: 1})
 	want("homeconnect/cooktop/status/power_state", "Off")
 	want("homeconnect/cooktop/zone/front_left/power", "off")
-	if !waitFor(t, 5*time.Second, func() bool { _, ok := seen.get("homeconnect/cooktop/status/program_timer_deadline"); return !ok }) {
-		t.Error("program timer not cleared at power-off")
+	if !waitFor(t, 5*time.Second, func() bool { _, ok := seen.get("homeconnect/cooktop/zone/front_left/timer_deadline"); return !ok }) {
+		t.Error("zone timer not cleared at power-off")
 	}
 
-	// Shutdown: last state offline, call log persisted.
+	// The hob starts refusing local sessions: refused, data unavailable, and
+	// after the (shrunk) threshold the power-cycle flag. Then it recovers.
+	hob.Refuse(503, nil, "")
+	hob.Drop()
+	want("homeconnect/cooktop/status/link_state", "refused")
+	want("homeconnect/cooktop/link", "offline")
+	want("homeconnect/cooktop/status/power_cycle_needed", "true")
+	hob.Refuse(0, nil, "")
+	want("homeconnect/cooktop/status/link_state", "connected")
+	want("homeconnect/cooktop/status/power_cycle_needed", "false")
+	want("homeconnect/cooktop/link", "online")
+
+	// Shutdown: Close 1000 to the hob, last will offline, state persisted.
 	sigCh <- syscall.SIGTERM
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("controller did not stop")
 	}
 	want("homeconnect/cooktop/connected", "offline")
-	if _, err := os.Stat(filepath.Join(dir, "calls.json")); err != nil {
-		t.Errorf("call log not saved: %v", err)
+	if codes := hob.CloseCodes(); len(codes) == 0 || codes[len(codes)-1] != 1000 {
+		t.Errorf("close codes %v", codes)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "alive")); err != nil {
-		t.Errorf("liveness file not written: %v", err)
+	for _, f := range []string{"alive", "device_id", "device.json", "link.json"} {
+		if f == "device_id" {
+			continue // the controller is handed its ID; main creates the file
+		}
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Errorf("%s not written: %v", f, err)
+		}
 	}
-	t.Logf("API calls made: %d", quota.Count24h())
+	if _, err := os.Stat(filepath.Join(dir, "calls.json")); err == nil {
+		t.Error("calls.json written: the cloud call log is gone in 2.0.0")
+	}
 }
