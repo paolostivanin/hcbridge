@@ -1,3 +1,5 @@
+# Unknown keys are rejected: check with  hcbridge --mode=check-config
+#
 # ─── OAuth (Home Connect developer credentials) ──────────────────
 # Register an application at https://developer.home-connect.com/
 # - OAuth Flow:  Device Flow
@@ -20,7 +22,7 @@ oauth:
 # Copy the haId for your hob into ha_id below.
 appliance:
   ha_id: ""
-  topic_slug: "cooktop"      # MQTT topic root: homeconnect/<topic_slug>/...
+  topic_slug: "cooktop"      # MQTT topic root: homeconnect/<topic_slug>/... ([a-z0-9_-] only)
   friendly_id: "Cooktop"      # HA device friendly name
 
 # ─── MQTT broker ──────────────────────────────────────────────────
@@ -29,8 +31,10 @@ mqtt:
   port: 1883
   # username: ""
   # password: ""
-  # client_id: hcbridge
+  # client_id: hcbridge-<hostname>   # default; must be unique per running bridge
   # discovery_topic: homeassistant   # HA's MQTT discovery prefix
+  # tls: false                       # true = ssl:// (TLS 1.2+), default port 8883
+  # ca_file: /etc/hcbridge/ca.pem    # CA for the broker certificate (needs tls: true)
 
 # ─── Logging ─────────────────────────────────────────────────────
 logfile: "/var/log/hcbridge/hcbridge.log"

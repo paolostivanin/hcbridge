@@ -5,3 +5,6 @@
 .idea/
 /log.txt
 *-dump.txt
+*.tmp
+/calls.json
+/alive

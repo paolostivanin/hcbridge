@@ -14,7 +14,7 @@ ExecStart=/opt/hcbridge/hcbridge --mode=run --config=/etc/hcbridge/config.yaml
 # Restart policy
 # -------------------------------------------------------------------
 Restart=always
-RestartSec=2
+RestartSec=10
 
 # -------------------------------------------------------------------
 # Security Hardening
@@ -23,14 +23,25 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=
 
 ReadOnlyPaths=/opt/hcbridge
-ReadWritePaths=/var/log/hcbridge /var/lib/hcbridge
+StateDirectory=hcbridge
+StateDirectoryMode=0700
+LogsDirectory=hcbridge
+LogsDirectoryMode=0700
+UMask=0077
 
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_INET6
 DevicePolicy=closed
+PrivateDevices=true
 ProtectProc=invisible
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 
 ProtectKernelTunables=true
 ProtectKernelModules=true

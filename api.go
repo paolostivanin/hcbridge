@@ -7,23 +7,27 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
 const acceptJSON = "application/vnd.bsh.sdk.v1+json"
 
 type APIClient struct {
-	cfg  *Config
-	auth *Authenticator
-	http *http.Client
+	cfg   *Config
+	auth  *Authenticator
+	quota *Quota
+	http  *http.Client
 }
 
-func NewAPIClient(cfg *Config, auth *Authenticator) *APIClient {
+func NewAPIClient(cfg *Config, auth *Authenticator, quota *Quota) *APIClient {
 	return &APIClient{
-		cfg:  cfg,
-		auth: auth,
-		http: &http.Client{Timeout: 30 * time.Second},
+		cfg:   cfg,
+		auth:  auth,
+		quota: quota,
+		http:  &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -65,35 +69,14 @@ type appliancesResponse struct {
 	} `json:"data"`
 }
 
-// rateLimitMu protects the rateLimitedUntil timestamp shared across goroutines.
-var rateLimitMu sync.Mutex
-var rateLimitedUntil time.Time
-
-// IsRateLimited returns true if a 429 response is still in effect.
-func IsRateLimited() (bool, time.Time) {
-	rateLimitMu.Lock()
-	defer rateLimitMu.Unlock()
-	return time.Now().Before(rateLimitedUntil), rateLimitedUntil
-}
-
-func setRateLimit(until time.Time) {
-	rateLimitMu.Lock()
-	rateLimitedUntil = until
-	rateLimitMu.Unlock()
-}
-
 func (c *APIClient) do(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
-	if blocked, until := IsRateLimited(); blocked {
+	if blocked, until := c.quota.Blocked(); blocked {
 		return nil, 429, fmt.Errorf("rate-limited until %s (skipping %s %s)", until.Format(time.RFC3339), method, path)
 	}
 
 	url := c.cfg.APIBase() + path
 
-	send := func() (*http.Response, error) {
-		tok, err := c.auth.AccessToken(ctx)
-		if err != nil {
-			return nil, err
-		}
+	send := func(tok string) (*http.Response, error) {
 		var rdr io.Reader
 		if body != nil {
 			rdr = bytes.NewReader(body)
@@ -107,39 +90,69 @@ func (c *APIClient) do(ctx context.Context, method, path string, body []byte) ([
 		if body != nil {
 			req.Header.Set("Content-Type", acceptJSON)
 		}
+		c.quota.RecordCall()
 		return c.http.Do(req)
 	}
 
-	resp, err := send()
+	tok, err := c.auth.AccessToken(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := send(tok)
 	if err != nil {
 		return nil, 0, err
 	}
 	if resp.StatusCode == 401 {
 		resp.Body.Close()
-		if _, rerr := c.auth.ForceRefresh(ctx); rerr != nil {
-			return nil, 401, rerr
+		c.quota.RecordResult(401)
+		tok, err = c.auth.ForceRefresh(ctx, tok)
+		if err != nil {
+			return nil, 401, err
 		}
-		resp, err = send()
+		resp, err = send(tok)
 		if err != nil {
 			return nil, 0, err
 		}
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	c.quota.RecordResult(resp.StatusCode)
 
-	// On 429, parse the suggested retry interval and set the global block.
-	// Body shape: {"error":{"description":"... blocked during the remaining
-	//              period of NNN seconds.", "key":"429"}}
+	// On 429, honour the announced block. Body shape:
+	// {"error":{"key":"429","description":"The rate limit \"1000 calls in 1
+	// day\" was reached. Requests are blocked during the remaining period of
+	// 54434 seconds."}}
 	if resp.StatusCode == 429 {
-		retrySecs := parse429RetrySeconds(data)
+		retrySecs := retryAfterSeconds(resp.Header, data)
 		if retrySecs <= 0 {
 			retrySecs = 3600 // sane default if we can't parse
 		}
-		setRateLimit(time.Now().Add(time.Duration(retrySecs) * time.Second))
+		c.quota.Block(time.Now().Add(time.Duration(retrySecs) * time.Second))
 	}
 
 	return data, resp.StatusCode, err
 }
+
+// retryAfterSeconds extracts the block length from a 429 response: the body's
+// "remaining period of N seconds" first (the form Bosch is known to send), then
+// a standard Retry-After header (delta-seconds). Returns 0 if neither parses.
+func retryAfterSeconds(h http.Header, body []byte) int {
+	if n := parse429RetrySeconds(body); n > 0 {
+		return n
+	}
+	if v := strings.TrimSpace(h.Get("Retry-After")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// retryPeriodRe matches Bosch's 429 description, e.g. "...blocked during the
+// remaining period of 82537 seconds.". The original hand-rolled scanner
+// compared an 8-byte slice against the 7-byte " second", so it never matched
+// and every block fell back to the 3600 s default.
+var retryPeriodRe = regexp.MustCompile(`of (\d+) seconds?`)
 
 func parse429RetrySeconds(body []byte) int {
 	var r struct {
@@ -150,52 +163,15 @@ func parse429RetrySeconds(body []byte) int {
 	if err := json.Unmarshal(body, &r); err != nil {
 		return 0
 	}
-	// "...remaining period of 82537 seconds." — pull the integer.
-	// Be lax: scan for "of <digits> seconds".
-	desc := r.Error.Description
-	idx := 0
-	for {
-		i := indexOf(desc[idx:], "of ")
-		if i < 0 {
-			return 0
-		}
-		idx += i + 3
-		end := idx
-		for end < len(desc) && desc[end] >= '0' && desc[end] <= '9' {
-			end++
-		}
-		if end == idx {
-			continue
-		}
-		// Verify this is followed by " seconds"
-		if end < len(desc) && desc[end:min(end+8, len(desc))] != " second" {
-			continue
-		}
-		n := 0
-		for k := idx; k < end; k++ {
-			n = n*10 + int(desc[k]-'0')
-		}
-		return n
-	}
-}
-
-func indexOf(s, sub string) int {
-	if len(sub) == 0 {
+	m := retryPeriodRe.FindStringSubmatch(r.Error.Description)
+	if m == nil {
 		return 0
 	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
 	}
-	return -1
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return n
 }
 
 func (c *APIClient) ListAppliances(ctx context.Context) ([]string, error) {
@@ -204,7 +180,7 @@ func (c *APIClient) ListAppliances(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	if code != 200 {
-		return nil, fmt.Errorf("list appliances %d: %s", code, string(body))
+		return nil, fmt.Errorf("list appliances %d: %s", code, snippet(body))
 	}
 	var r appliancesResponse
 	if err := json.Unmarshal(body, &r); err != nil {
@@ -218,61 +194,54 @@ func (c *APIClient) ListAppliances(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-// FetchAll returns the union of /status and /settings as a flat key→value map.
-func (c *APIClient) FetchAll(ctx context.Context, haID string) (map[string]interface{}, error) {
+// FetchAll returns the union of /status and /settings as a flat key→value map,
+// and whether the appliance is online. Two API calls; one when /status answers
+// 409, which is how the API reports an appliance that is not connected (the
+// settings call would only fail the same way).
+//
+// Active program options (per-zone state) are deliberately not fetched here:
+// Bridge.PollActiveOptions reads them with the right endpoint and the per-zone
+// bookkeeping.
+func (c *APIClient) FetchAll(ctx context.Context, haID string) (map[string]interface{}, bool, error) {
 	out := make(map[string]interface{})
 
 	statusBody, statusCode, err := c.do(ctx, "GET", "/api/homeappliances/"+haID+"/status", nil)
 	if err != nil {
-		return nil, fmt.Errorf("fetch status: %w", err)
+		return nil, false, fmt.Errorf("fetch status: %w", err)
 	}
-	if statusCode == 200 {
+	switch statusCode {
+	case 200:
 		var r listResponse
 		if err := json.Unmarshal(statusBody, &r); err != nil {
-			return nil, fmt.Errorf("parse status: %w", err)
+			return nil, false, fmt.Errorf("parse status: %w", err)
 		}
 		for _, kv := range r.Data.Items {
 			out[kv.Key] = kv.Value
 		}
-	} else if statusCode != 404 && statusCode != 409 {
-		return nil, fmt.Errorf("status %d: %s", statusCode, string(statusBody))
+	case 409:
+		return out, false, nil
+	case 404:
+	default:
+		return nil, false, fmt.Errorf("status %d: %s", statusCode, snippet(statusBody))
 	}
 
 	settingsBody, settingsCode, err := c.do(ctx, "GET", "/api/homeappliances/"+haID+"/settings", nil)
 	if err != nil {
-		return nil, fmt.Errorf("fetch settings: %w", err)
+		return nil, false, fmt.Errorf("fetch settings: %w", err)
 	}
 	if settingsCode == 200 {
 		var r settingsListResponse
 		if err := json.Unmarshal(settingsBody, &r); err != nil {
-			return nil, fmt.Errorf("parse settings: %w", err)
+			return nil, false, fmt.Errorf("parse settings: %w", err)
 		}
 		for _, kv := range r.Data.Items {
 			out[kv.Key] = kv.Value
 		}
 	} else if settingsCode != 404 && settingsCode != 409 {
-		return nil, fmt.Errorf("settings %d: %s", settingsCode, string(settingsBody))
+		return nil, false, fmt.Errorf("settings %d: %s", settingsCode, snippet(settingsBody))
 	}
 
-	// Active program options (per-zone state lives here for hobs, and Bosch
-	// does not push these via SSE). 404 when nothing is cooking — fine.
-	optsBody, optsCode, err := c.do(ctx, "GET", "/api/homeappliances/"+haID+"/programs/active/options", nil)
-	if err != nil {
-		return nil, fmt.Errorf("fetch program options: %w", err)
-	}
-	if optsCode == 200 {
-		var r optionsListResponse
-		if err := json.Unmarshal(optsBody, &r); err != nil {
-			return nil, fmt.Errorf("parse program options: %w", err)
-		}
-		for _, kv := range r.Data.Items {
-			out[kv.Key] = kv.Value
-		}
-	} else if optsCode != 404 && optsCode != 409 {
-		return nil, fmt.Errorf("program options %d: %s", optsCode, string(optsBody))
-	}
-
-	return out, nil
+	return out, true, nil
 }
 
 // RawGET fetches an arbitrary API path and returns the response body + status.
@@ -287,9 +256,8 @@ func (c *APIClient) PutSetting(ctx context.Context, haID, key string, value inte
 }
 
 // PutActiveOption sends PUT /api/homeappliances/{haId}/programs/active/options/{key}.
-// Used for per-zone state writes on hobs (Cooking.Hob.Option.ZoneSelector,
-// Cooking.Hob.Option.PowerLevel, BSH.Common.Option.Duration, etc.). Requires
-// Hob-Control scope.
+// On a hob the change needs confirming on the panel, so it is CLI-only
+// (--mode=put) and never driven from MQTT.
 func (c *APIClient) PutActiveOption(ctx context.Context, haID, key string, value interface{}) error {
 	return c.putKV(ctx, "/api/homeappliances/"+haID+"/programs/active/options/"+key, key, value)
 }
@@ -312,7 +280,7 @@ func (c *APIClient) putKV(ctx context.Context, path, key string, value interface
 		return err
 	}
 	if code != 204 && code != 200 {
-		return fmt.Errorf("PUT %s -> %d: %s", key, code, string(resp))
+		return fmt.Errorf("PUT %s -> %d: %s", key, code, snippet(resp))
 	}
 	return nil
 }

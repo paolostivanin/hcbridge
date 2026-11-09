@@ -1,0 +1,39 @@
+#!/sbin/openrc-run
+# hcbridge OpenRC service (Alpine). Install as /etc/init.d/hcbridge.
+#
+# supervise-daemon restarts the bridge if it exits or crashes; the old
+# start-stop-daemon script left it dead until someone noticed. stdout/stderr
+# go to files, so a panic or a fatal config error leaves a trace instead of
+# vanishing into /dev/null. The healthcheck restarts a wedged process: the
+# main loop rewrites /var/lib/hcbridge/alive every minute.
+#
+# Switching from the old script: run `rc-service hcbridge stop` with the OLD
+# script still installed, then install this one and start. Otherwise the new
+# script cannot find the old process and two bridges with the same MQTT
+# client ID fight over the broker.
+
+name="hcbridge"
+description="Home Connect cloud to MQTT bridge"
+supervisor="supervise-daemon"
+command="/opt/hcbridge/hcbridge"
+command_args="--mode=run --config=/etc/hcbridge/config.yaml"
+command_user="hcbridge:hcbridge"
+pidfile="/run/${RC_SVCNAME}.pid"
+respawn_delay=10
+respawn_max=0
+output_log="/var/log/hcbridge/stdout.log"
+error_log="/var/log/hcbridge/stderr.log"
+umask=077
+no_new_privs=yes
+
+healthcheck_delay=180
+healthcheck_timer=60
+healthcheck() {
+	[ -f /var/lib/hcbridge/alive ] || return 1
+	[ $(( $(date +%s) - $(stat -c %Y /var/lib/hcbridge/alive) )) -lt 300 ]
+}
+
+depend() {
+	need net
+	after firewall
+}

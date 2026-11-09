@@ -40,8 +40,8 @@ func NewLogger(file, level string) *Logger {
 	if file != "" {
 		w = &lumberjack.Logger{
 			Filename:   file,
-			MaxSize:    1,
-			MaxBackups: 3,
+			MaxSize:    5,
+			MaxBackups: 7,
 			MaxAge:     14,
 			Compress:   true,
 		}
@@ -59,7 +59,11 @@ func (l *Logger) emit(lvl int, tag, format string, args ...interface{}) {
 	l.std.Printf(tag+" "+format, args...)
 }
 
-func (l *Logger) Debug(format string, args ...interface{}) { l.emit(lvlDebug, "[DEBUG]", format, args...) }
-func (l *Logger) Info(format string, args ...interface{})  { l.emit(lvlInfo, "[INFO]", format, args...) }
-func (l *Logger) Warn(format string, args ...interface{})  { l.emit(lvlWarn, "[WARN]", format, args...) }
-func (l *Logger) Error(format string, args ...interface{}) { l.emit(lvlError, "[ERROR]", format, args...) }
+func (l *Logger) Debug(format string, args ...interface{}) {
+	l.emit(lvlDebug, "[DEBUG]", format, args...)
+}
+func (l *Logger) Info(format string, args ...interface{}) { l.emit(lvlInfo, "[INFO]", format, args...) }
+func (l *Logger) Warn(format string, args ...interface{}) { l.emit(lvlWarn, "[WARN]", format, args...) }
+func (l *Logger) Error(format string, args ...interface{}) {
+	l.emit(lvlError, "[ERROR]", format, args...)
+}
