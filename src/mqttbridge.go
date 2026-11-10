@@ -223,6 +223,9 @@ func (b *Bridge) Disconnect() {
 // publish sets a retained state topic, skipping unchanged values. Reports
 // whether it published.
 func (b *Bridge) publish(suffix, payload string) bool {
+	if payload == "" {
+		payload = noValue // never an empty retained payload: see noValue
+	}
 	b.mu.Lock()
 	if prev, ok := b.lastPub[suffix]; ok && prev == payload && !b.failed[suffix] {
 		b.mu.Unlock()

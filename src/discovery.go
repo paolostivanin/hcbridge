@@ -351,7 +351,7 @@ func PublishDiscovery(cfg *Config, meta deviceMeta, cli mqtt.Client, log *Logger
 
 	failed, errs, aborted := pass(entities)
 	if len(failed) > 0 && !aborted {
-		failed, errs, _ = pass(failed) // one retry; only what still fails is reported
+		_, errs, _ = pass(failed) // one retry; only what still fails is reported
 	}
 	if len(errs) == 0 {
 		log.Info("MQTT discovery published (%d entities)", published)

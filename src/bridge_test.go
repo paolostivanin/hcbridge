@@ -38,7 +38,7 @@ func TestProgramLevelMapping(t *testing.T) {
 
 	// ActiveProgram 0 (no program) decodes to nil: an empty payload.
 	b.ApplyValues([]hc.Value{{UID: 256, Name: "BSH.Common.Root.ActiveProgram"}}, false)
-	want(t, b, "status/active_program", "")
+	want(t, b, "status/active_program", noValue)
 }
 
 func TestZonePowerAndState(t *testing.T) {
@@ -126,7 +126,7 @@ func TestTimers(t *testing.T) {
 		t.Error("timer tick republished the deadline")
 	}
 	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 0))
-	want(t, b, "zone/rear_left/timer_deadline", "")
+	want(t, b, "zone/rear_left/timer_deadline", noValue)
 
 	apply(b, num("BSH.Common.Option.RemainingProgramTime", 600))
 	if got, _ := b.get("status/program_timer_deadline"); got == "" {
@@ -205,8 +205,8 @@ func TestPowerOffResets(t *testing.T) {
 	want(t, b, "zone/front_left/power", "off")
 	want(t, b, "zone/front_left/state", "off")
 	want(t, b, "zone/front_right/state", "residual_heat") // reported by the hob, kept
-	want(t, b, "zone/front_left/timer_deadline", "")
-	want(t, b, "status/program_timer_deadline", "")
+	want(t, b, "zone/front_left/timer_deadline", noValue)
+	want(t, b, "status/program_timer_deadline", noValue)
 	want(t, b, "joined_left", "false")
 	want(t, b, "status/fan_level", "3") // the fan is the hob's to report (after-run)
 }
@@ -356,4 +356,58 @@ func TestApplyDescriptionsIgnoresAValueThatIsNotThere(t *testing.T) {
 	const fan = "Cooking.Hob.Setting.Ventilation"
 	b.ApplyDescriptions([]hc.Description{{UID: 4409, Name: fan, Value: &hc.Value{Name: fan, Symbol: "AfterRun"}}})
 	want(t, b, "status/fan_level", "afterrun")
+}
+
+// "No value" is retained as the word None, never as an empty payload: an
+// empty retained payload deletes the topic, and a client that was offline then
+// never hears that the value is gone.
+func TestNoValueIsRetainedAsNone(t *testing.T) {
+	b := newTestBridge()
+	out := capture(b)
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 86))
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 0))
+	b.ApplyValues([]hc.Value{{UID: 256, Name: "BSH.Common.Root.ActiveProgram"}}, false) // program 0 decodes to nil
+	b.PublishLink(hc.LinkConnecting, time.Time{}, false)                                // no start time yet
+	want(t, b, "zone/rear_left/timer_deadline", noValue)
+	want(t, b, "status/active_program", noValue)
+	want(t, b, "status/link_since", noValue)
+	for _, l := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		if strings.HasSuffix(strings.TrimSuffix(l, " [retained]"), "= ") {
+			t.Errorf("an empty retained payload went out: %q", l)
+		}
+	}
+}
+
+// The deletion of removed entities is the one place empty retained payloads
+// are wanted, and it must keep working: on every connect, exactly those
+// topics are emptied and nothing else is.
+func TestOnlyRemovedTopicsGetAnEmptyRetainedPayload(t *testing.T) {
+	b := newTestBridge()
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"), num("Cooking.Hob.Status.Zone.100.RemainingProgramTime", 300))
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off"))
+	b.ApplyValues([]hc.Value{{UID: 256, Name: "BSH.Common.Root.ActiveProgram"}}, false)
+	f := newFakeMQTT()
+	b.cli = f
+	b.onConnect(f)
+
+	allowed := map[string]bool{}
+	for _, d := range removedDiscovery {
+		allowed[discoveryTopic(b.cfg, d.component, d.objectID)] = true
+	}
+	for _, s := range removedStateTopics {
+		allowed[b.cfg.StateTopic(s)] = true
+	}
+	emptied := 0
+	for _, p := range f.published() {
+		if p.payload != "" {
+			continue
+		}
+		if !p.retained || !allowed[p.topic] {
+			t.Errorf("unexpected empty publish: %+v", p)
+		}
+		emptied++
+	}
+	if emptied != len(allowed) {
+		t.Errorf("%d removed topics emptied, want %d", emptied, len(allowed))
+	}
 }

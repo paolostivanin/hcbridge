@@ -4,7 +4,7 @@
 
 A small single-binary bridge from a Bosch/Siemens/Neff (BSH) hob to MQTT,
 written in Go, speaking the appliance's **local** Home Connect protocol: no
-cloud at runtime, no API quota, no OAuth. Version 2.0.0 (`hcbridge --version`).
+cloud at runtime, no API quota, no OAuth. Version 2.0.1 (`hcbridge --version`).
 
 ## Contents
 
@@ -326,7 +326,9 @@ Update anything in HA that used the removed entities
   (`link.json`: a restart keeps the power-cycle clock and waits before
   redialling) and the last device info (`device.json`: the firmware in HA
   before the first connect).
-- **MQTT**: auto-reconnect with a last will (`connected = offline`); the full
+- **MQTT**: auto-reconnect (backoff capped at 30 s) with a last will
+  (`connected = offline`), which the bridge counters with `online` first on every
+  connect; the full
   retained state is republished on every reconnect, and a publish that was not
   acknowledged is retried on the next update. The first broker connection may
   take as long as it needs (no exit on a boot race). Values the hob pushes
@@ -407,7 +409,7 @@ State (retained, published by the bridge):
 - `homeconnect/cooktop/status/program_duration`
 - `homeconnect/cooktop/status/elapsed_program_time`
 - `homeconnect/cooktop/status/program_progress`
-- `homeconnect/cooktop/status/program_timer_deadline` - RFC3339 or empty
+- `homeconnect/cooktop/status/program_timer_deadline` - RFC3339 or `None`
 - `homeconnect/cooktop/status/focused_zone`
 - `homeconnect/cooktop/status/fan_level`
 - `homeconnect/cooktop/status/carbon_filter_saturation`
@@ -419,7 +421,7 @@ State (retained, published by the bridge):
 - `homeconnect/cooktop/status/heartbeat` - RFC3339
 - `homeconnect/cooktop/zone/{front_left,front_right,rear_left,rear_right}/power`
 - `homeconnect/cooktop/zone/{...}/state`
-- `homeconnect/cooktop/zone/{...}/timer_deadline` - RFC3339 or empty
+- `homeconnect/cooktop/zone/{...}/timer_deadline` - RFC3339 or `None`
 - `homeconnect/cooktop/joined_left` / `joined_right` - `true` | `false`
 
 Events (not retained; payload `Present`, `Confirmed` or `Off`):
@@ -428,6 +430,12 @@ Events (not retained; payload `Present`, `Confirmed` or `Off`):
 - `homeconnect/cooktop/event/program_aborted`
 - `homeconnect/cooktop/event/carbon_filter_nearly_saturated`
 - `homeconnect/cooktop/event/carbon_filter_saturated`
+
+`None` as a payload means "no value" (no timer running, no program active):
+Home Assistant shows it as unknown. It is retained rather than an empty
+payload, which would delete the topic from the broker so that a client that
+was offline at that moment never learned the value is gone. The only empty
+retained payloads the bridge sends are the deletions of removed entities.
 
 There are no command topics.
 

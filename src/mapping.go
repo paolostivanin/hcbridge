@@ -134,6 +134,15 @@ var removedStateTopics = []string{
 	"cloud",
 }
 
+// noValue is the retained payload for "no value" (no timer running, no
+// program active). Home Assistant reads exactly "None" as unknown, for every
+// kind of sensor. An empty retained payload would instead delete the
+// message from the broker: a client that was offline at that moment (HA
+// restarting, say) then never learns the value is gone, and keeps showing the
+// old one. A real value "None" cannot occur. Only the topics of removed
+// entities are published empty, on purpose, to delete them.
+const noValue = "None"
+
 // cleanEnum strips an enum prefix ("BSH.Common.EnumType.PowerState.On" ->
 // "On"). Local values arrive as bare member names already; this keeps
 // fully qualified names readable too.

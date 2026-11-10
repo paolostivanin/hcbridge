@@ -198,7 +198,10 @@ func TestE2E(t *testing.T) {
 	hob.Notify(map[int]any{531: 1})
 	want("homeconnect/cooktop/status/power_state", "Off")
 	want("homeconnect/cooktop/zone/front_left/power", "off")
-	if !waitFor(t, 5*time.Second, func() bool { _, ok := seen.get("homeconnect/cooktop/zone/front_left/timer_deadline"); return !ok }) {
+	if !waitFor(t, 5*time.Second, func() bool {
+		v, _ := seen.get("homeconnect/cooktop/zone/front_left/timer_deadline")
+		return v == "None"
+	}) {
 		t.Error("zone timer not cleared at power-off")
 	}
 
