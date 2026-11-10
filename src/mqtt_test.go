@@ -391,9 +391,20 @@ func TestBridgeAgainstABroker(t *testing.T) {
 	root := b.cfg.StateTopic("")
 	waitRetained(t, fb, root+"connected", "online")
 	waitRetained(t, fb, root+"link", "offline")
-	pubs := fb.published()
-	if len(pubs) < 2 || pubs[0].topic != root+"link" || pubs[1].topic != root+"connected" {
-		t.Fatalf("first publishes %+v, want link then connected", pubs[:min(len(pubs), 3)])
+	// The link before online, both before discovery. (paho may send the
+	// very first publish twice: one it hands over while resuming its store
+	// at connect is resent as a duplicate. Same value, so harmless.)
+	first := func(prefix string) int {
+		for i, p := range fb.published() {
+			if strings.HasPrefix(p.topic, prefix) {
+				return i
+			}
+		}
+		return 1 << 30
+	}
+	waitFor(t, 5*time.Second, func() bool { return first("homeassistant/") < 1<<30 })
+	if l, c, d := first(root+"link"), first(root+"connected"), first("homeassistant/"); !(l < c && c < d) {
+		t.Fatalf("first link at %d, connected at %d, discovery at %d: want that order", l, c, d)
 	}
 
 	apply(b, sym("BSH.Common.Setting.PowerState", "On"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "50"))
@@ -410,7 +421,8 @@ func TestBridgeAgainstABroker(t *testing.T) {
 
 	b.Disconnect()
 	waitRetained(t, fb, root+"connected", "offline")
-	if _, d := fb.counts(); d != 1 {
+	if !waitFor(t, 2*time.Second, func() bool { _, d := fb.counts(); return d == 1 }) {
+		_, d := fb.counts()
 		t.Fatalf("%d clean disconnects, want 1", d)
 	}
 	b.Disconnect() // a second call is a no-op
@@ -653,5 +665,29 @@ func TestHeldValueGoesOutAtShutdown(t *testing.T) {
 	pubs := f.published()
 	if v, _ := f.last(b.cfg.StateTopic("status/program_progress")); v != "99" || pubs[len(pubs)-1].payload != "offline" {
 		t.Fatalf("progress %q on the broker, last publish %+v", v, pubs[len(pubs)-1])
+	}
+}
+
+// paho's resume() writes the DUP flag on stored publishes while the same
+// packet may be in flight; the store must hand it a copy.
+func TestStoreKeepsACopyOfPublishes(t *testing.T) {
+	st := copyingStore{mqtt.NewMemoryStore()}
+	st.Open()
+	defer st.Close()
+	p := packets.NewControlPacket(packets.Publish).(*packets.PublishPacket)
+	p.TopicName, p.Payload, p.MessageID, p.Qos = "t", []byte("v"), 9, 1
+	st.Put("o.9", p)
+	got, ok := st.Get("o.9").(*packets.PublishPacket)
+	if !ok || got == p || got.TopicName != "t" || string(got.Payload) != "v" || got.MessageID != 9 {
+		t.Fatalf("stored %p (%+v), sent %p", got, got, p)
+	}
+	got.Dup = true
+	if p.Dup {
+		t.Fatal("marking the stored packet changed the one in flight")
+	}
+	rel := packets.NewControlPacket(packets.Pubrel)
+	st.Put("i.1", rel)
+	if st.Get("i.1") != rel {
+		t.Error("other packets are stored as they are")
 	}
 }

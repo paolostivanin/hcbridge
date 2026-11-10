@@ -15,6 +15,7 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang/packets"
 
 	hc "hcbridge/src/internal/homeconnect"
 )
@@ -51,6 +52,22 @@ type zoneObs struct {
 	state string // State member: Off, Active, ResiduelHeat, NotSelectable
 	op    string // OperationState member: Ready, Run, Pause, Finished, ...
 	power string // power label: off, 1, 1.5, ..., Boost1
+}
+
+// copyingStore is paho's in-memory store, except that it keeps a copy of
+// each publish instead of the packet itself. paho v1.5.1's resume() sets
+// the DUP flag on the stored packet while that same packet may still be on
+// its way out (a publish handed over just as the connection came back): one
+// object, written by two goroutines, a data race the race detector catches.
+// With a copy, resume() marks and resends its own packet.
+type copyingStore struct{ *mqtt.MemoryStore }
+
+func (s copyingStore) Put(key string, m packets.ControlPacket) {
+	if p, ok := m.(*packets.PublishPacket); ok {
+		c := *p // the payload slice is shared: paho never writes it
+		m = &c
+	}
+	s.MemoryStore.Put(key, m)
 }
 
 // outMsg is one queued publish. A state message names a retained state topic
@@ -100,7 +117,7 @@ type Bridge struct {
 	throttle  map[string]time.Duration // throttledSuffixes; a field so tests can shrink it
 	retryWait time.Duration            // publishRetryDelay; a field so tests can shrink it
 
-	store *mqtt.MemoryStore // paho's store of unacknowledged publishes (see storeDrained)
+	store copyingStore // paho's store of unacknowledged publishes (see storeDrained)
 
 	kickCh   chan struct{} // wakes the sender
 	stopCh   chan struct{} // closed by Disconnect
@@ -138,7 +155,7 @@ func NewBridge(cfg *Config, meta deviceMeta, log *Logger) *Bridge {
 		retryAt:   map[string]time.Time{},
 		throttle:  maps.Clone(throttledSuffixes),
 		retryWait: publishRetryDelay,
-		store:     mqtt.NewMemoryStore(),
+		store:     copyingStore{mqtt.NewMemoryStore()},
 		kickCh:    make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 		loopDone:  make(chan struct{}),
