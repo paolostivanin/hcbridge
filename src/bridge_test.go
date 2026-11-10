@@ -337,3 +337,23 @@ func TestPowerOffResetCancelledByPowerOn(t *testing.T) {
 	want(t, b, "zone/front_left/state", "active")
 	want(t, b, "zone/front_left/power", "5")
 }
+
+// A value that is not there (a JSON null in an access change) must not erase
+// the retained filter state, but a value carried by its symbol still applies.
+func TestApplyDescriptionsIgnoresAValueThatIsNotThere(t *testing.T) {
+	b := newTestBridge()
+	const carbon = "Cooking.Hob.Status.CarbonFilterSaturation"
+	b.ApplyDescriptions([]hc.Description{{UID: 4096, Name: carbon, Value: &hc.Value{Name: carbon, V: 96.0}}})
+	want(t, b, "status/carbon_filter_saturation", "96")
+	out := capture(b)
+
+	b.ApplyDescriptions([]hc.Description{{UID: 4096, Name: carbon, Value: &hc.Value{Name: carbon}}}) // null
+	if out.String() != "" {
+		t.Fatalf("a null access change published something:\n%s", out)
+	}
+	want(t, b, "status/carbon_filter_saturation", "96")
+
+	const fan = "Cooking.Hob.Setting.Ventilation"
+	b.ApplyDescriptions([]hc.Description{{UID: 4409, Name: fan, Value: &hc.Value{Name: fan, Symbol: "AfterRun"}}})
+	want(t, b, "status/fan_level", "afterrun")
+}

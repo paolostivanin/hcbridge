@@ -512,3 +512,29 @@ func TestResumeEpisode(t *testing.T) {
 		t.Fatal("recovery log does not span the resumed episode")
 	}
 }
+
+// An access change with "value": null carries no value; it must come out as a
+// change without Value, while a sibling with a real value keeps its own.
+func TestNullValueInAnAccessChangeIsNotAValue(t *testing.T) {
+	srv := newServer(t)
+	h := start(t, srv, nil)
+	h.rec.waitLink(t, hc.LinkConnected, 1)
+	srv.SendRaw([]byte(`{"sID":1,"msgID":2,"resource":"/ro/descriptionChange","version":1,"action":"NOTIFY","data":[` +
+		`{"uid":4409,"access":"READ","value":null},{"uid":8204,"access":"READ","value":13}]}`))
+	var changes []hc.Description
+	waitFor(t, 2*time.Second, "the access change", func() bool {
+		for _, ev := range h.rec.events() {
+			if ev.Kind == hc.EvDescription && len(ev.Changes) == 2 {
+				changes = ev.Changes
+				return true
+			}
+		}
+		return false
+	})
+	if changes[0].UID != 4409 || changes[0].Value != nil {
+		t.Errorf("null value decoded as a value: %+v", changes[0])
+	}
+	if changes[1].UID != 8204 || changes[1].Value == nil || changes[1].Value.Symbol != "65" {
+		t.Errorf("real value lost: %+v", changes[1])
+	}
+}

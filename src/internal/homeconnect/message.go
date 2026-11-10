@@ -143,6 +143,13 @@ func parseMessage(b []byte) (*Message, error) {
 	return m, nil
 }
 
+// isJSONNull reports a literal JSON null. An access change that carries
+// "value": null has no value to report; treating it as one would make the
+// bridge publish an empty state and erase what the broker retains.
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
 // uidValue is one entry of /ro/values and /ro/allMandatoryValues.
 type uidValue struct {
 	UID   flexInt         `json:"uid"`

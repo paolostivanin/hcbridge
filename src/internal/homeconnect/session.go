@@ -244,7 +244,7 @@ func (s *session) emitDescriptions(m *Message) {
 		if f, ok := s.c.prof.Feature(d.UID); ok {
 			d.Name = f.Name
 		}
-		if len(it.Value) > 0 {
+		if len(it.Value) > 0 && !isJSONNull(it.Value) {
 			v := s.c.prof.Decode(d.UID, it.Value)
 			d.Value = &v
 		}

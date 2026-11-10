@@ -314,6 +314,11 @@ func (b *Bridge) ApplyDescriptions(ds []hc.Description) {
 		if d.Value == nil || d.Name == "" {
 			continue
 		}
+		if d.Value.V == nil && d.Value.Symbol == "" {
+			// Nothing to report (a JSON null): publishing it would send an
+			// empty state and erase a retained value such as the filter's.
+			continue
+		}
 		if _, isEvent := eventKeyToSuffix[d.Name]; isEvent {
 			continue
 		}
