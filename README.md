@@ -39,8 +39,7 @@ Appliance data:
 
 Diagnostics:
 - `binary_sensor.cooktop_local_control` - someone is touching the panel
-- `sensor.cooktop_wifi_signal` (dBm) and `binary_sensor.cooktop_home_connect_cloud`
-  - the hob's own Wi-Fi signal and its link to the Home Connect cloud
+- `sensor.cooktop_wifi_signal` (dBm) - the hob's own Wi-Fi signal
 - `sensor.cooktop_local_link` - `connecting`, `connected`, `refused` (the hob
   answers HTTP 503, see below), `unreachable` (no TCP connection), `key_error`
   (the profile key no longer matches), `error`
@@ -334,7 +333,6 @@ State (retained, published by the bridge):
 - `homeconnect/cooktop/status/carbon_filter_saturation`
 - `homeconnect/cooktop/status/carbon_filter_replace` - `true` | `false`
 - `homeconnect/cooktop/status/wifi_signal`
-- `homeconnect/cooktop/status/backend_connected` - `true` | `false`
 - `homeconnect/cooktop/status/link_state`
 - `homeconnect/cooktop/status/link_since` - RFC3339
 - `homeconnect/cooktop/status/power_cycle_needed` - `true` | `false`

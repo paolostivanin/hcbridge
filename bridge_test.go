@@ -26,7 +26,6 @@ func TestProgramLevelMapping(t *testing.T) {
 		num("BSH.Common.Option.Duration", 124),
 		sym("Cooking.Hob.Option.ZoneSelector", "RearRight"),
 		num("BSH.Common.Status.WiFiSignalStrength", -44),
-		boolv("BSH.Common.Status.BackendConnected", true),
 	)
 	want(t, b, "status/operation_state", "Run")
 	want(t, b, "status/power_state", "On")
@@ -36,7 +35,6 @@ func TestProgramLevelMapping(t *testing.T) {
 	want(t, b, "status/program_duration", "124")
 	want(t, b, "status/focused_zone", "RearRight")
 	want(t, b, "status/wifi_signal", "-44")
-	want(t, b, "status/backend_connected", "true")
 
 	// ActiveProgram 0 (no program) decodes to nil: an empty payload.
 	b.ApplyValues([]hc.Value{{UID: 256, Name: "BSH.Common.Root.ActiveProgram"}}, false)

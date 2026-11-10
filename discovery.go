@@ -190,10 +190,6 @@ func discoveryEntities(cfg *Config) []discoveryEntity {
 			"device_class":        "signal_strength",
 			"state_class":         "measurement",
 		})),
-		diag(data("binary_sensor", "backend_connected", "home_connect_cloud", "Home Connect cloud", boolPayloads(map[string]interface{}{
-			"state_topic":  st("status/backend_connected"),
-			"device_class": "connectivity",
-		}))),
 		discoveryEntity{"sensor", "link_state", id("sensor", "local_link"), "Local link", true, false, map[string]interface{}{
 			"state_topic":  st("status/link_state"),
 			"device_class": "enum",

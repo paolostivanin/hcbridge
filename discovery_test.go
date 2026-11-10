@@ -39,7 +39,6 @@ var liveEntityIDs = map[string]string{
 	"hcbridge_cooktop_carbon_filter_saturation": "sensor.cooktop_carbon_filter_saturation",
 	"hcbridge_cooktop_carbon_filter_replace":    "binary_sensor.cooktop_carbon_filter_replace",
 	"hcbridge_cooktop_wifi_signal":              "sensor.cooktop_wifi_signal",
-	"hcbridge_cooktop_backend_connected":        "binary_sensor.cooktop_home_connect_cloud",
 	"hcbridge_cooktop_link_state":               "sensor.cooktop_local_link",
 	"hcbridge_cooktop_link_since":               "sensor.cooktop_local_link_since",
 	"hcbridge_cooktop_power_cycle_needed":       "binary_sensor.cooktop_power_cycle_needed",

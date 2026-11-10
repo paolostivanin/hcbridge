@@ -25,7 +25,6 @@ var keyToSuffix = map[string]string{
 	"Cooking.Hob.Setting.Ventilation":           "status/fan_level",
 	"Cooking.Hob.Status.CarbonFilterSaturation": "status/carbon_filter_saturation",
 	"BSH.Common.Status.WiFiSignalStrength":      "status/wifi_signal",
-	"BSH.Common.Status.BackendConnected":        "status/backend_connected",
 }
 
 // throttledSuffixes are published at most this often while they change.
@@ -52,9 +51,14 @@ var eventKeyToSuffix = map[string]string{
 // Keys the hob pushes that are understood but deliberately not published.
 // Logged at DEBUG, not as new keys.
 var ignoredKeys = map[string]bool{
-	"BSH.Common.Root.SelectedProgram":                    true,
-	"BSH.Common.Setting.AlarmClock":                      true,
-	"BSH.Common.Setting.AllowBackendConnection":          true,
+	"BSH.Common.Root.SelectedProgram":           true,
+	"BSH.Common.Setting.AlarmClock":             true,
+	"BSH.Common.Setting.AllowBackendConnection": true,
+	// The hob's own view of its Home Connect cloud link. Not published: it
+	// pushes a change to false (seen at 17:04 on 2026-11-09) but never the
+	// recovery, so it read false for hours while the cloud worked; only the
+	// 6-hourly full read corrected it.
+	"BSH.Common.Status.BackendConnected":                 true,
 	"BSH.Common.Setting.AllowConsumerInsights":           true,
 	"BSH.Common.Setting.TemperatureUnit":                 true,
 	"BSH.Common.Status.RemoteControlActive":              true,
