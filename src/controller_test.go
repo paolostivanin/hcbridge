@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -32,6 +34,70 @@ func TestLinkGraceSurvivesQuickReconnect(t *testing.T) {
 	c.streamDown()
 	if !waitFor(t, time.Second, func() bool { v, _ := c.bridge.get("link"); return v == "offline" }) {
 		t.Fatal("link never went offline after the grace")
+	}
+}
+
+// The grace timer of an outage fires just as the session comes back: its
+// callback, already past the timer, must not mark the recovered session
+// unavailable, nor drop the timer of a newer outage.
+func TestExpiredGraceCannotOverrideARecoveredSession(t *testing.T) {
+	cfg := testConfig()
+	cfg.StateDirectory = t.TempDir()
+	c := newController(cfg, hcfake.Profile(), "0a1b2c3d", newTestBridge(), quietLogger())
+	c.offlineGrace = time.Hour // only the callbacks invoked below run
+	c.streamUpNow()
+	c.streamDown()
+	c.streamMu.Lock()
+	gen := c.streamGen
+	c.streamMu.Unlock()
+	c.streamUpNow()       // the session is back...
+	c.offlineExpired(gen) // ...as the old grace's callback runs
+	if got, _ := c.bridge.get("link"); got != "online" {
+		t.Fatalf("link = %q after the session came back, want online", got)
+	}
+	c.streamDown() // a new outage
+	c.offlineExpired(gen)
+	c.streamMu.Lock()
+	timer := c.offlineTimer
+	c.streamMu.Unlock()
+	if timer == nil {
+		t.Fatal("a stale callback dropped the new outage's grace timer")
+	}
+	if got, _ := c.bridge.get("link"); got != "online" {
+		t.Fatalf("link = %q: a stale callback ended the new grace early", got)
+	}
+}
+
+// The threshold check and a recovery race: whichever runs first, the hob is
+// connected in the end, on MQTT and in link.json.
+func TestThresholdCheckCannotOverrideARecovery(t *testing.T) {
+	t0 := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 100; i++ {
+		cfg := testConfig()
+		cfg.StateDirectory = t.TempDir()
+		b := newTestBridge()
+		c := newController(cfg, hcfake.Profile(), "0a1b2c3d", b, quietLogger())
+		c.mon.threshold = time.Minute
+		var now atomic.Int64
+		now.Store(t0.UnixNano())
+		c.now = func() time.Time { return time.Unix(0, now.Load()) }
+		c.onLink(hc.LinkStatus{State: hc.LinkRefused, Since: t0})
+		now.Store(t0.Add(time.Minute).UnixNano()) // the threshold is reached...
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); c.evaluateLink() }()
+		go func() { defer wg.Done(); c.onLink(hc.LinkStatus{State: hc.LinkConnected, Since: t0.Add(time.Minute)}) }() // ...as the hob recovers
+		wg.Wait()
+		if st, _ := b.get("status/link_state"); st != "connected" {
+			t.Fatalf("run %d: link_state = %q, want connected", i, st)
+		}
+		if pc, _ := b.get("status/power_cycle_needed"); pc != "false" {
+			t.Fatalf("run %d: power_cycle_needed = %q after recovery", i, pc)
+		}
+		rec, err := loadLinkRecord(cfg.StateDirectory)
+		if err != nil || rec.State != "connected" || rec.Latched {
+			t.Fatalf("run %d: link.json %+v %v, want connected and not latched", i, rec, err)
+		}
 	}
 }
 

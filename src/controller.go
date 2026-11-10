@@ -34,12 +34,18 @@ type controller struct {
 	bridge   *Bridge
 	log      *Logger
 
+	// linkMu is held across every link decision, its link.json write and its
+	// publish, so the three happen in the same order for every goroutine
+	// (the dispatcher, the main loop's threshold check, the dial loop). The
+	// bridge's publishes only queue, so holding it there never waits on MQTT.
 	linkMu   sync.Mutex
 	mon      linkMonitor
 	lastDial time.Time
 
+	// streamMu likewise covers each availability decision and its publish.
 	streamMu     sync.Mutex
 	streamUp     bool
+	streamGen    uint64 // bumped on every up and every grace started: identifies the live grace timer
 	offlineTimer *time.Timer
 	offlineGrace time.Duration // linkOfflineGrace; a field so tests can shrink it
 	evalEvery    time.Duration
@@ -87,9 +93,12 @@ func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <
 		notBefore = rec.LastDial.Add(gap)
 	}
 
-	// The session is not up yet; mark the data entities unavailable unless
-	// it comes up within the grace period (the normal case).
-	c.streamDown()
+	// The session is not up yet, and nothing says the broker's retained
+	// values are current: the data entities are unavailable until it is.
+	c.streamMu.Lock()
+	c.streamUp = false
+	c.bridge.SetLink(false)
+	c.streamMu.Unlock()
 
 	opts := hc.Options{
 		Host:      c.cfg.Appliance.Host,
@@ -133,7 +142,9 @@ func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <
 			case <-time.After(shutdownWait):
 				c.log.Warn("local session did not close within %s", shutdownWait)
 			}
-			c.saveLink()
+			c.linkMu.Lock()
+			c.saveLinkLocked()
+			c.linkMu.Unlock()
 			return
 		case now := <-heartbeatTicker.C:
 			c.bridge.PublishHeartbeat(now)
@@ -165,9 +176,9 @@ func (c *controller) onLink(st hc.LinkStatus) {
 	c.linkMu.Lock()
 	c.mon.update(st)
 	pc := c.mon.powerCycleNeeded(c.now())
-	c.linkMu.Unlock()
-	c.saveLink() // persist before announcing
+	c.saveLinkLocked() // persist before announcing
 	c.bridge.PublishLink(st.State, st.Since, pc)
+	c.linkMu.Unlock()
 	if st.State == hc.LinkConnected {
 		c.streamUpNow()
 	} else {
@@ -177,31 +188,32 @@ func (c *controller) onLink(st hc.LinkStatus) {
 
 // evaluateLink re-checks the power-cycle threshold: retries in the same
 // state produce no events, so the clock is checked on a timer.
+//
+// The whole check runs under linkMu: a session connecting meanwhile cannot
+// publish connected/false only to be overwritten by a refused/true decided
+// a moment before.
 func (c *controller) evaluateLink() {
 	c.linkMu.Lock()
+	defer c.linkMu.Unlock()
 	was := c.mon.latched
-	pc := c.mon.powerCycleNeeded(c.now())
-	state, since := c.mon.state, c.mon.since
-	c.linkMu.Unlock()
-	if pc && !was {
+	if pc := c.mon.powerCycleNeeded(c.now()); pc && !was {
 		c.log.Warn("the hob has refused local connections for %s; power cycle it (breaker off ~30 s)", c.cfg.Link.PowerCycleAfter)
-		c.saveLink() // persist before announcing
-		c.bridge.PublishLink(state, since, pc)
+		c.saveLinkLocked() // persist before announcing
+		c.bridge.PublishLink(c.mon.state, c.mon.since, pc)
 	}
 }
 
 func (c *controller) onDial(at time.Time) {
 	c.linkMu.Lock()
+	defer c.linkMu.Unlock()
 	c.lastDial = at
-	c.linkMu.Unlock()
-	c.saveLink()
+	c.saveLinkLocked()
 }
 
-func (c *controller) saveLink() {
-	c.linkMu.Lock()
-	rec := c.mon.record(c.lastDial)
-	c.linkMu.Unlock()
-	if err := saveLinkRecord(c.cfg.StateDir(), rec); err != nil {
+// saveLinkLocked writes link.json; call with linkMu held, which also keeps
+// the writes in order (the last one written is the latest state).
+func (c *controller) saveLinkLocked() {
+	if err := saveLinkRecord(c.cfg.StateDir(), c.mon.record(c.lastDial)); err != nil {
 		c.log.Warn("write link.json: %v", err)
 	}
 }
@@ -241,12 +253,13 @@ func (c *controller) touchAlive() {
 
 func (c *controller) streamUpNow() {
 	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
 	c.streamUp = true
+	c.streamGen++ // a grace callback already running finds itself superseded
 	if c.offlineTimer != nil {
 		c.offlineTimer.Stop()
 		c.offlineTimer = nil
 	}
-	c.streamMu.Unlock()
 	c.bridge.SetLink(true)
 }
 
@@ -259,14 +272,25 @@ func (c *controller) streamDown() {
 	if c.offlineTimer != nil {
 		return
 	}
-	c.offlineTimer = time.AfterFunc(c.offlineGrace, func() {
-		c.streamMu.Lock()
-		up := c.streamUp
-		c.offlineTimer = nil
-		c.streamMu.Unlock()
-		if !up {
-			c.log.Warn("local session down for %s; marking cooktop data unavailable", c.offlineGrace)
-			c.bridge.SetLink(false)
-		}
-	})
+	c.streamGen++
+	gen := c.streamGen
+	c.offlineTimer = time.AfterFunc(c.offlineGrace, func() { c.offlineExpired(gen) })
+}
+
+// offlineExpired ends the grace period gen. Decision and publish are one
+// critical section, and a grace that the session coming back (or a newer
+// grace) superseded does nothing: the expired timer of an old outage can
+// neither mark a recovered session unavailable nor drop a newer timer.
+func (c *controller) offlineExpired(gen uint64) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	if gen != c.streamGen {
+		return
+	}
+	c.offlineTimer = nil
+	if c.streamUp {
+		return
+	}
+	c.log.Warn("local session down for %s; marking cooktop data unavailable", c.offlineGrace)
+	c.bridge.SetLink(false)
 }

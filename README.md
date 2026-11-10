@@ -320,7 +320,8 @@ Update anything in HA that used the removed entities
   for the connection rules. A corrupted frame or a missing pong ends the
   session with a Close frame and a reconnect; a stale key shows as `key_error`
   after three failed connects. The data entities go unavailable 30 s after the
-  session drops (a routine reconnect takes a second).
+  session drops (a routine reconnect takes a second), and from startup until
+  the first session is up.
 - **State**: the state directory holds the device ID (never replaced on its
   own: a damaged file is an error), the lock, the last link episode
   (`link.json`: a restart keeps the power-cycle clock and waits before
