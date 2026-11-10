@@ -61,14 +61,23 @@ func runLocalWatch(ctx context.Context, cfg *Config, raw bool, recordPath string
 		w.rec = json.NewEncoder(f)
 	}
 	log := NewLogger("", cfg.LogLevel) // the terminal, never the service's log file
-	client, err := hc.NewClient(hc.Options{
-		Host: cfg.Appliance.Host, DeviceID: id, Log: log, Raw: raw,
-	}, prof, w.handle)
+	// The service's link.json: the first dial keeps the spacing the service
+	// had reached, and both the dials and the link changes are written back,
+	// so a session here ends the service's refusal episode and a refusal here
+	// continues it. No Resume: every state is printed.
+	w.link = openLinkBook(dir, cfg.Link.PowerCycleAfter, log)
+	opts := hc.Options{Host: cfg.Appliance.Host, DeviceID: id, Log: log, Raw: raw}
+	w.link.clientOptions(&opts, false)
+	client, err := hc.NewClient(opts, prof, w.handle)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "    %s at %s, device ID %s\n", prof, cfg.Appliance.Host, id)
+	if wait := time.Until(opts.NotBefore); wait > 0 {
+		fmt.Fprintf(os.Stderr, "note: first dial in %s, spaced from the last one in link.json\n", wait.Round(time.Second))
+	}
 	client.Run(ctx)
+	w.link.save()
 	return nil
 }
 
@@ -80,7 +89,8 @@ type watchPrinter struct {
 	mu     sync.Mutex
 	out    io.Writer
 	rec    *json.Encoder
-	bridge *Bridge // dry run; nil in tests that only check the raw lines
+	bridge *Bridge   // dry run; nil in tests that only check the raw lines
+	link   *linkBook // nil in tests that only check the raw lines
 }
 
 func (w *watchPrinter) line(tag, format string, args ...any) {
@@ -124,6 +134,9 @@ func (w *watchPrinter) handle(ev hc.Event) {
 			w.line("LINK", "%s", l.State)
 		}
 		w.record(recEntry{Kind: "link", Link: string(l.State)})
+		if w.link != nil {
+			w.link.record(l, time.Now())
+		}
 	case hc.EvInfo:
 		i := ev.Info
 		rssi := "?"

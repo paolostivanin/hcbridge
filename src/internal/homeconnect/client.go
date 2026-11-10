@@ -49,6 +49,10 @@ type Options struct {
 	// NotBefore delays the first dial (carried over from a previous run so
 	// a restart loop cannot hammer the appliance).
 	NotBefore time.Time
+	// ResumeBackoff continues the retry spacing of a previous run's failure
+	// episode: the backoff starts there (capped at BackoffMax) instead of
+	// at BackoffMin.
+	ResumeBackoff time.Duration
 	// OnDial is called right before every dial attempt.
 	OnDial func(time.Time)
 	// Resume continues a failure episode from a previous run (refused,
@@ -224,6 +228,9 @@ func (c *Client) Run(ctx context.Context) {
 		c.setLink(LinkConnecting, nil)
 	}
 	backoff := o.BackoffMin
+	if o.ResumeBackoff > backoff {
+		backoff = min(o.ResumeBackoff, o.BackoffMax)
+	}
 	firstFrameFails := 0
 	var lastDial time.Time
 	for {

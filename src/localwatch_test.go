@@ -100,6 +100,44 @@ func TestLocalWatchAgainstFake(t *testing.T) {
 	}
 }
 
+// local-watch shares link.json with the service: its first dial keeps the
+// spacing the service had reached, and a session it gets ends the service's
+// refusal episode (power_cycle_needed included) for the next service start.
+func TestLocalWatchSharesTheLinkRecord(t *testing.T) {
+	srv := hcfake.New()
+	defer srv.Close()
+	cfg := localTestConfig(t, srv.Host())
+	lastDial := time.Now().Add(-29500 * time.Millisecond) // a 30 s gap ends in 0.5 s
+	seed := linkRecord{State: "refused", Since: lastDial.Add(-10 * time.Second), RefusedSince: lastDial.Add(-time.Hour), Latched: true, LastDial: lastDial}
+	if err := saveLinkRecord(cfg.StateDir(), seed); err != nil {
+		t.Fatal(err)
+	}
+
+	out := &syncBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- runLocalWatch(ctx, cfg, false, "", out) }()
+	if !waitFor(t, 5*time.Second, func() bool { return strings.Contains(out.String(), "=== snapshot") }) {
+		t.Fatalf("no snapshot:\n%s", out)
+	}
+	dials := srv.DialTimes()
+	if len(dials) != 1 || dials[0].Sub(start) < 300*time.Millisecond {
+		t.Fatalf("dials %v (started %v): the first dial must wait for the spacing in link.json", dials, start)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	rec, err := loadLinkRecord(cfg.StateDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != "connected" || rec.Latched || !rec.RefusedSince.IsZero() || !rec.LastDial.After(lastDial) {
+		t.Fatalf("link.json after a local-watch session: %+v", rec)
+	}
+}
+
 func TestProfileSummary(t *testing.T) {
 	dir := hcfake.WriteProfileDir(t.TempDir())
 	cfg := localTestConfig(t, "127.0.0.1")

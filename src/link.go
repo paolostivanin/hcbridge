@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"time"
 
 	hc "hcbridge/src/internal/homeconnect"
@@ -61,4 +62,100 @@ func (m *linkMonitor) restore(r linkRecord) {
 
 func (m *linkMonitor) record(lastDial time.Time) linkRecord {
 	return linkRecord{State: string(m.state), Since: m.since, RefusedSince: m.refusedSince, Latched: m.latched, LastDial: lastDial}
+}
+
+// Dial spacing carried over from link.json (see linkBook.spacing).
+const (
+	resumeGapConnected = 5 * time.Second // after a run that ended connected
+	resumeGapMin       = 30 * time.Second
+	resumeGapMax       = 5 * time.Minute // the client's backoff cap
+)
+
+// linkBook is the link episode the two local clients share through
+// link.json: the power-cycle monitor and the last dial. The service and
+// local-watch (never both at once: the state-dir lock) each load it at
+// start and write it on every dial and link change, so the spacing of dials
+// and the refusal episode carry over from one to the other, and across
+// restarts.
+type linkBook struct {
+	dir string
+	log *Logger
+
+	// mu is held across every decision, its link.json write and (in the
+	// service) its publish, so the three happen in the same order for every
+	// goroutine; it also keeps the writes in order.
+	mu       sync.Mutex
+	mon      linkMonitor
+	lastDial time.Time
+	loaded   linkRecord // as read at start
+}
+
+func openLinkBook(dir string, threshold time.Duration, log *Logger) *linkBook {
+	rec, err := loadLinkRecord(dir)
+	if err != nil {
+		log.Warn("read link.json: %v (starting fresh)", err)
+	}
+	lb := &linkBook{dir: dir, log: log, mon: linkMonitor{threshold: threshold}, lastDial: rec.LastDial, loaded: rec}
+	lb.mon.restore(rec)
+	return lb
+}
+
+// saveLocked writes link.json; call with mu held.
+func (lb *linkBook) saveLocked() {
+	if err := saveLinkRecord(lb.dir, lb.mon.record(lb.lastDial)); err != nil {
+		lb.log.Warn("write link.json: %v", err)
+	}
+}
+
+func (lb *linkBook) save() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.saveLocked()
+}
+
+// onDial records a dial attempt (hc.Options.OnDial).
+func (lb *linkBook) onDial(at time.Time) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.lastDial = at
+	lb.saveLocked()
+}
+
+// record applies and persists a link change, for local-watch; the service
+// does the same under mu and publishes too.
+func (lb *linkBook) record(st hc.LinkStatus, now time.Time) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.mon.update(st)
+	lb.mon.powerCycleNeeded(now)
+	lb.saveLocked()
+}
+
+// spacing is when the first dial may happen and the backoff to carry on
+// with, from the record loaded at start: at least resumeGapConnected after
+// the last dial, and after a failure episode as far apart as its retries
+// had grown by then (the episode's length, from resumeGapMin up to the
+// backoff cap). So neither a restart nor local-watch after the service
+// starts the backoff over at 5 s against a hob that refuses.
+func (lb *linkBook) spacing() (notBefore time.Time, backoff time.Duration) {
+	r := lb.loaded
+	if r.LastDial.IsZero() {
+		return time.Time{}, 0
+	}
+	if r.State == "" || hc.LinkState(r.State) == hc.LinkConnected {
+		return r.LastDial.Add(resumeGapConnected), 0
+	}
+	gap := min(max(r.LastDial.Sub(r.Since), resumeGapMin), resumeGapMax)
+	return r.LastDial.Add(gap), gap
+}
+
+// clientOptions sets the dial spacing and the dial hook in o; with resume,
+// the client also continues the loaded episode's state (the service: its
+// retries in that state stay silent and keep the episode's start time).
+func (lb *linkBook) clientOptions(o *hc.Options, resume bool) {
+	o.NotBefore, o.ResumeBackoff = lb.spacing()
+	o.OnDial = lb.onDial
+	if resume {
+		o.Resume = hc.LinkStatus{State: hc.LinkState(lb.loaded.State), Since: lb.loaded.Since}
+	}
 }

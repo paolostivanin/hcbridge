@@ -144,8 +144,9 @@ connection:
   other projects); any frame counts as a sign of life
 - no `Origin` header (the hob ignores upgrades that carry one)
 - a clean WebSocket Close before every deliberate disconnect and on shutdown
-- reconnects back off from 5 s to 5 min with jitter; the last dial survives a
-  restart, so a crash loop cannot hammer the hob
+- reconnects back off from 5 s to 5 min with jitter; the last dial and the
+  spacing reached survive a restart (and carry over between the service and
+  `local-watch`), so neither a crash loop nor a diagnostic run hammers the hob
 
 When the hob refuses anyway, `sensor.cooktop_local_link` turns `refused` and,
 after `link.power_cycle_after` (30 min), `binary_sensor.cooktop_power_cycle_needed`
@@ -315,7 +316,9 @@ Update anything in HA that used the removed entities
   (`[LINK]`) and what run mode would publish (`[PUB]`). `--raw` adds the
   decrypted frames; `--record=<file>` appends the values as JSON lines
   (never the key or the device info). It takes the same lock as the service,
-  so the two cannot run at once.
+  so the two cannot run at once, and shares its `link.json`: the first dial
+  keeps the spacing the service had reached (up to 5 min while the hob was
+  refusing), and a session it gets clears the service's refusal episode.
 - `--version` - print version, VCS revision and toolchain.
 
 ### 8.2 Resilience
@@ -328,8 +331,8 @@ Update anything in HA that used the removed entities
   the first session is up.
 - **State**: the state directory holds the device ID (never replaced on its
   own: a damaged file is an error), the lock, the last link episode
-  (`link.json`: a restart keeps the power-cycle clock and waits before
-  redialling) and the last device info (`device.json`: the firmware in HA
+  (`link.json`: a restart keeps the power-cycle clock and the dial spacing)
+  and the last device info (`device.json`: the firmware in HA
   before the first connect).
 - **MQTT**: auto-reconnect (backoff capped at 30 s) with a last will
   (`connected = offline`), which the bridge counters on every connect with the

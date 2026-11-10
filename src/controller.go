@@ -34,13 +34,12 @@ type controller struct {
 	bridge   *Bridge
 	log      *Logger
 
-	// linkMu is held across every link decision, its link.json write and its
-	// publish, so the three happen in the same order for every goroutine
-	// (the dispatcher, the main loop's threshold check, the dial loop). The
-	// bridge's publishes only queue, so holding it there never waits on MQTT.
-	linkMu   sync.Mutex
-	mon      linkMonitor
-	lastDial time.Time
+	// link is the episode shared with local-watch through link.json. Its
+	// lock is held across every link decision, its link.json write and its
+	// publish (the dispatcher, the main loop's threshold check, the dial
+	// loop). The bridge's publishes only queue, so holding it there never
+	// waits on MQTT.
+	link *linkBook
 
 	// streamMu likewise covers each availability decision and its publish.
 	streamMu     sync.Mutex
@@ -57,7 +56,7 @@ type controller struct {
 func newController(cfg *Config, prof *hc.Profile, deviceID string, bridge *Bridge, log *Logger) *controller {
 	return &controller{
 		cfg: cfg, prof: prof, deviceID: deviceID, bridge: bridge, log: log,
-		mon:          linkMonitor{threshold: cfg.Link.PowerCycleAfter},
+		link:         openLinkBook(cfg.StateDir(), cfg.Link.PowerCycleAfter, log),
 		offlineGrace: linkOfflineGrace,
 		evalEvery:    linkEvalEvery,
 		now:          time.Now,
@@ -69,29 +68,14 @@ func (c *controller) alivePath() string { return filepath.Join(c.cfg.StateDir(),
 // run blocks until a signal arrives on sigCh, then closes the session
 // cleanly and returns.
 func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <-chan os.Signal) {
-	// Carry a link episode over from the previous run: a restart in the
-	// middle of a 503 episode keeps its power-cycle clock, and the first
-	// dial respects the previous one.
-	rec, err := loadLinkRecord(c.cfg.StateDir())
-	if err != nil {
-		c.log.Warn("read link.json: %v (starting fresh)", err)
+	// Carry the link episode over from the previous run (or local-watch): a
+	// restart in the middle of a 503 episode keeps its power-cycle clock,
+	// and the dials stay as far apart as they had grown.
+	c.link.mu.Lock()
+	if rec := c.link.loaded; rec.State != "" {
+		c.bridge.PublishLink(hc.LinkState(rec.State), rec.Since, c.link.mon.powerCycleNeeded(c.now()))
 	}
-	c.linkMu.Lock()
-	c.mon.restore(rec)
-	c.lastDial = rec.LastDial
-	pc := c.mon.powerCycleNeeded(c.now())
-	c.linkMu.Unlock()
-	if rec.State != "" {
-		c.bridge.PublishLink(hc.LinkState(rec.State), rec.Since, pc)
-	}
-	notBefore := time.Time{}
-	if !rec.LastDial.IsZero() {
-		gap := 5 * time.Second
-		if rec.State != "" && hc.LinkState(rec.State) != hc.LinkConnected {
-			gap = 30 * time.Second
-		}
-		notBefore = rec.LastDial.Add(gap)
-	}
+	c.link.mu.Unlock()
 
 	// The session is not up yet, and nothing says the broker's retained
 	// values are current: the data entities are unavailable until it is.
@@ -100,13 +84,10 @@ func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <
 	c.bridge.SetLink(false)
 	c.streamMu.Unlock()
 
-	opts := hc.Options{
-		Host:      c.cfg.Appliance.Host,
-		DeviceID:  c.deviceID,
-		Log:       c.log,
-		NotBefore: notBefore,
-		OnDial:    c.onDial,
-		Resume:    hc.LinkStatus{State: hc.LinkState(rec.State), Since: rec.Since},
+	opts := hc.Options{Host: c.cfg.Appliance.Host, DeviceID: c.deviceID, Log: c.log}
+	c.link.clientOptions(&opts, true)
+	if wait := time.Until(opts.NotBefore); wait > time.Second {
+		c.log.Info("first dial in %s, spaced from the previous one", wait.Round(time.Second))
 	}
 	if c.optsHook != nil {
 		c.optsHook(&opts)
@@ -142,9 +123,7 @@ func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <
 			case <-time.After(shutdownWait):
 				c.log.Warn("local session did not close within %s", shutdownWait)
 			}
-			c.linkMu.Lock()
-			c.saveLinkLocked()
-			c.linkMu.Unlock()
+			c.link.save()
 			return
 		case now := <-heartbeatTicker.C:
 			c.bridge.PublishHeartbeat(now)
@@ -173,12 +152,12 @@ func (c *controller) handle(ev hc.Event) {
 }
 
 func (c *controller) onLink(st hc.LinkStatus) {
-	c.linkMu.Lock()
-	c.mon.update(st)
-	pc := c.mon.powerCycleNeeded(c.now())
-	c.saveLinkLocked() // persist before announcing
+	c.link.mu.Lock()
+	c.link.mon.update(st)
+	pc := c.link.mon.powerCycleNeeded(c.now())
+	c.link.saveLocked() // persist before announcing
 	c.bridge.PublishLink(st.State, st.Since, pc)
-	c.linkMu.Unlock()
+	c.link.mu.Unlock()
 	if st.State == hc.LinkConnected {
 		c.streamUpNow()
 	} else {
@@ -189,32 +168,18 @@ func (c *controller) onLink(st hc.LinkStatus) {
 // evaluateLink re-checks the power-cycle threshold: retries in the same
 // state produce no events, so the clock is checked on a timer.
 //
-// The whole check runs under linkMu: a session connecting meanwhile cannot
-// publish connected/false only to be overwritten by a refused/true decided
-// a moment before.
+// The whole check runs under the link lock: a session connecting meanwhile
+// cannot publish connected/false only to be overwritten by a refused/true
+// decided a moment before.
 func (c *controller) evaluateLink() {
-	c.linkMu.Lock()
-	defer c.linkMu.Unlock()
-	was := c.mon.latched
-	if pc := c.mon.powerCycleNeeded(c.now()); pc && !was {
+	c.link.mu.Lock()
+	defer c.link.mu.Unlock()
+	m := &c.link.mon
+	was := m.latched
+	if pc := m.powerCycleNeeded(c.now()); pc && !was {
 		c.log.Warn("the hob has refused local connections for %s; power cycle it (breaker off ~30 s)", c.cfg.Link.PowerCycleAfter)
-		c.saveLinkLocked() // persist before announcing
-		c.bridge.PublishLink(c.mon.state, c.mon.since, pc)
-	}
-}
-
-func (c *controller) onDial(at time.Time) {
-	c.linkMu.Lock()
-	defer c.linkMu.Unlock()
-	c.lastDial = at
-	c.saveLinkLocked()
-}
-
-// saveLinkLocked writes link.json; call with linkMu held, which also keeps
-// the writes in order (the last one written is the latest state).
-func (c *controller) saveLinkLocked() {
-	if err := saveLinkRecord(c.cfg.StateDir(), c.mon.record(c.lastDial)); err != nil {
-		c.log.Warn("write link.json: %v", err)
+		c.link.saveLocked() // persist before announcing
+		c.bridge.PublishLink(m.state, m.since, pc)
 	}
 }
 

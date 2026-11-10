@@ -357,6 +357,22 @@ func TestFailedSnapshotIsRetriedOnTheSameSession(t *testing.T) {
 	}
 }
 
+// A resumed episode keeps its retry spacing: the backoff starts at
+// ResumeBackoff, not at BackoffMin.
+func TestResumeBackoff(t *testing.T) {
+	srv := newServer(t)
+	srv.Refuse(503, nil, "")
+	h := start(t, srv, func(o *hc.Options) {
+		o.BackoffMin, o.BackoffMax, o.ResumeBackoff = 10*time.Millisecond, 400*time.Millisecond, 150*time.Millisecond
+	})
+	waitFor(t, 3*time.Second, "two dials", func() bool { return len(srv.DialTimes()) >= 2 })
+	h.stop()
+	d := srv.DialTimes()
+	if gap := d[1].Sub(d[0]); gap < 120*time.Millisecond {
+		t.Fatalf("second dial %s after the first; want the resumed backoff (~150 ms), not BackoffMin", gap)
+	}
+}
+
 func TestMalformedMessageKeepsSession(t *testing.T) {
 	srv := newServer(t)
 	h := start(t, srv, nil)

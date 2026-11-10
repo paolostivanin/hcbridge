@@ -77,7 +77,7 @@ func TestThresholdCheckCannotOverrideARecovery(t *testing.T) {
 		cfg.StateDirectory = t.TempDir()
 		b := newTestBridge()
 		c := newController(cfg, hcfake.Profile(), "0a1b2c3d", b, quietLogger())
-		c.mon.threshold = time.Minute
+		c.link.mon.threshold = time.Minute
 		var now atomic.Int64
 		now.Store(t0.UnixNano())
 		c.now = func() time.Time { return time.Unix(0, now.Load()) }
@@ -121,7 +121,7 @@ func startController(t *testing.T, srv *hcfake.Server) *ctlHarness {
 	c := newController(cfg, hcfake.Profile(), "0a1b2c3d", b, quietLogger())
 	c.offlineGrace = 50 * time.Millisecond
 	c.evalEvery = 20 * time.Millisecond
-	c.mon.threshold = 200 * time.Millisecond
+	c.link.mon.threshold = 200 * time.Millisecond
 	c.optsHook = func(o *hc.Options) {
 		o.BackoffMin, o.BackoffMax, o.MinDialGap = 20*time.Millisecond, 50*time.Millisecond, 10*time.Millisecond
 	}

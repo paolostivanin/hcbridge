@@ -96,7 +96,7 @@ func TestE2E(t *testing.T) {
 	ctl := newController(cfg, hcfake.Profile(), "0a1b2c3d", bridge, log)
 	ctl.offlineGrace = 200 * time.Millisecond
 	ctl.evalEvery = 50 * time.Millisecond
-	ctl.mon.threshold = 500 * time.Millisecond
+	ctl.link.mon.threshold = 500 * time.Millisecond
 	ctl.optsHook = func(o *hc.Options) {
 		o.BackoffMin, o.BackoffMax, o.MinDialGap = 50*time.Millisecond, 200*time.Millisecond, 20*time.Millisecond
 	}
