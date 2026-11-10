@@ -19,6 +19,14 @@ import (
 
 const publishTimeout = 30 * time.Second
 
+// powerOffGrace is how long after PowerState=Off the hob gets to report the
+// end state of every zone itself (it does so within about 0.3 s: levels to
+// off, running zones to residual heat or off). Only what is still stale
+// after that is reset, so the safety net never contradicts the hob: reset at
+// once, a zone showed "off" for 0.24 s before the hob's "residual heat"
+// arrived (seen 2026-11-10).
+const powerOffGrace = 2 * time.Second
+
 // carbonReplaceAt is the saturation (percent) from which the carbon filter
 // is flagged for replacement. The hob's own "nearly saturated" event was
 // seen at 96%; the event also latches the flag.
@@ -59,6 +67,8 @@ type Bridge struct {
 	carbonLatched bool
 	meta          deviceMeta
 
+	powerOffDelay time.Duration // powerOffGrace; zero resets synchronously (tests)
+
 	discoveryMu sync.Mutex
 }
 
@@ -75,6 +85,8 @@ func NewBridge(cfg *Config, meta deviceMeta, log *Logger) *Bridge {
 		zones:     map[string]*zoneObs{},
 		joinFlag:  map[string]bool{},
 		meta:      meta,
+
+		powerOffDelay: powerOffGrace,
 	}
 	for _, z := range allZones {
 		b.zones[z] = &zoneObs{}
@@ -363,8 +375,25 @@ func (b *Bridge) applyKV(key string, value interface{}, snapshot bool) {
 	b.publishThrottled(suffix, payload)
 
 	if key == "BSH.Common.Setting.PowerState" && payload == "Off" {
-		b.resetOnPowerOff()
+		b.schedulePowerOffReset()
 	}
+}
+
+// schedulePowerOffReset runs resetOnPowerOff after the grace, if the hob is
+// still off by then (it may have been switched on again).
+func (b *Bridge) schedulePowerOffReset() {
+	if b.powerOffDelay <= 0 {
+		b.resetOnPowerOff()
+		return
+	}
+	time.AfterFunc(b.powerOffDelay, func() {
+		b.mu.Lock()
+		off := b.lastPub["status/power_state"] == "Off"
+		b.mu.Unlock()
+		if off {
+			b.resetOnPowerOff()
+		}
+	})
 }
 
 // applyZone handles Cooking.Hob.Status.Zone.<id>.<attr>.
@@ -475,8 +504,9 @@ func (b *Bridge) updateDeadline(suffix string, remainingSecs int) bool {
 }
 
 // resetOnPowerOff: once the hob is off no zone heats, no timer runs and no
-// pair is joined. The hob pushes most of this itself; resetting here covers
-// a missed push. Residual heat is kept: the hob reports it after power-off.
+// pair is joined. The hob pushes all of this itself right after power-off;
+// resetting here (after powerOffGrace) covers a missed push. Residual heat is
+// kept: the hob reports it after power-off.
 func (b *Bridge) resetOnPowerOff() {
 	b.mu.Lock()
 	for _, z := range b.zones {

@@ -292,3 +292,50 @@ func TestLabels(t *testing.T) {
 		}
 	}
 }
+
+// Seen on the real hob (2026-11-10 07:09): PowerState=Off arrives, and the
+// zone's ResiduelHeat push follows 0.24 s later. The reset must not publish
+// "off" for the zone in between.
+func TestPowerOffDoesNotContradictResidualHeat(t *testing.T) {
+	b := newTestBridge()
+	b.powerOffDelay = 100 * time.Millisecond
+	out := capture(b)
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"),
+		sym("Cooking.Hob.Status.Zone.300.State", "Active"), sym("Cooking.Hob.Status.Zone.300.PowerLevel", "65"))
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off"))
+	apply(b, sym("Cooking.Hob.Status.Zone.300.State", "ResiduelHeat"), sym("Cooking.Hob.Status.Zone.300.PowerLevel", "Off"))
+	time.Sleep(250 * time.Millisecond) // past the grace
+	want(t, b, "zone/rear_right/state", "residual_heat")
+	for _, l := range strings.Split(out.String(), "\n") {
+		if strings.Contains(l, "zone/rear_right/state") && strings.HasSuffix(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(l), "[retained]")), "= off") {
+			t.Fatalf("rear_right state went off before residual heat:\n%s", out)
+		}
+	}
+}
+
+// A push the hob never sends is still cleaned up, after the grace.
+func TestPowerOffResetsMissedPushesAfterGrace(t *testing.T) {
+	b := newTestBridge()
+	b.powerOffDelay = 50 * time.Millisecond
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"),
+		sym("Cooking.Hob.Status.Zone.100.State", "Active"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "50"))
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off")) // and no zone push follows
+	want(t, b, "zone/front_left/state", "active")         // not yet
+	if !waitFor(t, 2*time.Second, func() bool { v, _ := b.get("zone/front_left/state"); return v == "off" }) {
+		t.Fatal("stale active zone never reset")
+	}
+	want(t, b, "zone/front_left/power", "off")
+}
+
+// Switched on again inside the grace: nothing is reset.
+func TestPowerOffResetCancelledByPowerOn(t *testing.T) {
+	b := newTestBridge()
+	b.powerOffDelay = 60 * time.Millisecond
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"),
+		sym("Cooking.Hob.Status.Zone.100.State", "Active"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "50"))
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off"))
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"))
+	time.Sleep(200 * time.Millisecond)
+	want(t, b, "zone/front_left/state", "active")
+	want(t, b, "zone/front_left/power", "5")
+}

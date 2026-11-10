@@ -26,6 +26,7 @@ func testConfig() *Config {
 func newTestBridge() *Bridge {
 	b := NewBridge(testConfig(), deviceMeta{}, quietLogger())
 	b.out = io.Discard
+	b.powerOffDelay = 0 // reset synchronously; the graced path has its own tests
 	return b
 }
 
