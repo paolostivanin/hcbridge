@@ -99,6 +99,11 @@ type Server struct {
 	values        map[int]any
 	failMandatory int
 	silentOnce    bool
+	failResource  map[string]int // resource -> error code to answer; -1: no answer
+	corruptFor    string         // corrupt the next response to this resource
+	noInit        bool           // never send /ei/initialValues
+	initEdMsgID   int            // edMsgID in /ei/initialValues; 0: no data
+	noCloseReply  bool           // never answer a Close
 	conns         map[*conn]bool
 	nextSID       int64
 
@@ -124,6 +129,7 @@ func New() *Server {
 	psk, iv := Profile().Keys()
 	s := &Server{
 		psk: psk, iv: iv, pong: true, ci: 2, ei: 2, ni: true, initVersion: 2,
+		initEdMsgID: 7000, failResource: map[string]int{},
 		values:  map[int]any{},
 		conns:   map[*conn]bool{},
 		nextSID: 1000,
@@ -186,6 +192,60 @@ func (s *Server) FailMandatory(code int, silentOnce bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failMandatory, s.silentOnce = code, silentOnce
+}
+
+// FailResource makes requests for resource answer code; -1 leaves them
+// unanswered (a timeout), 0 restores normal answers.
+func (s *Server) FailResource(resource string, code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if code == 0 {
+		delete(s.failResource, resource)
+	} else {
+		s.failResource[resource] = code
+	}
+}
+
+// CorruptResponseTo breaks the MAC of the next response to resource.
+func (s *Server) CorruptResponseTo(resource string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.corruptFor = resource
+}
+
+// SetSendInit controls whether the appliance opens with /ei/initialValues.
+func (s *Server) SetSendInit(on bool) { s.mu.Lock(); s.noInit = !on; s.mu.Unlock() }
+
+// SetInitEdMsgID sets the edMsgID the appliance announces; 0 sends none.
+func (s *Server) SetInitEdMsgID(id int) { s.mu.Lock(); s.initEdMsgID = id; s.mu.Unlock() }
+
+// SetCloseReply controls whether the appliance answers a Close frame.
+func (s *Server) SetCloseReply(on bool) { s.mu.Lock(); s.noCloseReply = !on; s.mu.Unlock() }
+
+// Reinit restarts the handshake on every live connection, as appliances
+// occasionally do.
+func (s *Server) Reinit() {
+	for _, c := range s.live() {
+		s.sendInit(c)
+	}
+}
+
+// SendText sends a text frame (the protocol only uses binary ones).
+func (s *Server) SendText(text string) {
+	for _, c := range s.live() {
+		c.wmu.Lock()
+		c.ws.WriteMessage(websocket.TextMessage, []byte(text))
+		c.wmu.Unlock()
+	}
+}
+
+// PingClient sends a WebSocket ping to every client.
+func (s *Server) PingClient() {
+	for _, c := range s.live() {
+		c.wmu.Lock()
+		c.ws.WriteControl(websocket.PingMessage, []byte("hi"), time.Now().Add(time.Second))
+		c.wmu.Unlock()
+	}
 }
 
 // Notify pushes NOTIFY /ro/values to every connected client and records
@@ -311,7 +371,6 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if s.concurrent > s.maxConcurrent {
 		s.maxConcurrent = s.concurrent
 	}
-	initVersion := s.initVersion
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -334,15 +393,21 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	ws.SetCloseHandler(func(code int, _ string) error {
 		s.mu.Lock()
 		s.closeCodes = append(s.closeCodes, code)
+		noReply := s.noCloseReply
 		s.mu.Unlock()
+		if noReply {
+			select {} // hang: the client has to give up waiting
+		}
 		return ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, ""), time.Now().Add(time.Second))
 	})
 
 	// The appliance speaks first.
-	s.send(c, map[string]any{
-		"sID": c.sid, "msgID": 500, "resource": "/ei/initialValues", "version": initVersion,
-		"action": "POST", "data": []map[string]any{{"edMsgID": 7000}},
-	})
+	s.mu.Lock()
+	noInit := s.noInit
+	s.mu.Unlock()
+	if !noInit {
+		s.sendInit(c)
+	}
 	for {
 		mt, frame, err := ws.ReadMessage()
 		if err != nil {
@@ -367,12 +432,35 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) sendInit(c *conn) {
+	s.mu.Lock()
+	v, ed := s.initVersion, s.initEdMsgID
+	s.mu.Unlock()
+	m := map[string]any{"sID": c.sid, "msgID": 500, "resource": "/ei/initialValues", "version": v, "action": "POST"}
+	if ed != 0 {
+		m["data"] = []map[string]any{{"edMsgID": ed}}
+	}
+	s.send(c, m)
+}
+
 func (s *Server) answer(c *conn, m Msg) {
 	if m.Action != "GET" && m.Action != "POST" {
 		return // RESPONSE to initialValues, NOTIFY deviceReady
 	}
 	reply := map[string]any{"sID": c.sid, "msgID": m.MsgID, "resource": m.Resource, "version": m.Version, "action": "RESPONSE"}
 	s.mu.Lock()
+	if code, ok := s.failResource[m.Resource]; ok {
+		s.mu.Unlock()
+		if code > 0 {
+			reply["code"] = code
+			s.send(c, reply)
+		}
+		return
+	}
+	if s.corruptFor == m.Resource {
+		s.corruptFor = ""
+		s.corruptNext = true
+	}
 	switch m.Resource {
 	case "/ci/services":
 		svcs := []map[string]any{{"service": "ci", "version": s.ci}, {"service": "ei", "version": s.ei}, {"service": "ro", "version": 1}}

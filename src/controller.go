@@ -45,7 +45,9 @@ type controller struct {
 	streamGen    uint64 // bumped on every up and every grace started: identifies the live grace timer
 	offlineTimer *time.Timer
 	offlineGrace time.Duration // linkOfflineGrace; a field so tests can shrink it
-	evalEvery    time.Duration
+	evalEvery    time.Duration // linkEvalEvery, heartbeatEvery, aliveEvery: likewise
+	beatEvery    time.Duration
+	aliveEvery   time.Duration
 
 	optsHook func(*hc.Options) // tests shorten the client's timings
 	now      func() time.Time
@@ -57,6 +59,8 @@ func newController(cfg *Config, prof *hc.Profile, deviceID string, bridge *Bridg
 		link:         openLinkBook(cfg.StateDir(), cfg.Link.PowerCycleAfter, log),
 		offlineGrace: linkOfflineGrace,
 		evalEvery:    linkEvalEvery,
+		beatEvery:    heartbeatEvery,
+		aliveEvery:   aliveEvery,
 		now:          time.Now,
 	}
 }
@@ -101,9 +105,9 @@ func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <
 		close(done)
 	}()
 
-	heartbeatTicker := time.NewTicker(heartbeatEvery)
+	heartbeatTicker := time.NewTicker(c.beatEvery)
 	defer heartbeatTicker.Stop()
-	aliveTicker := time.NewTicker(aliveEvery)
+	aliveTicker := time.NewTicker(c.aliveEvery)
 	defer aliveTicker.Stop()
 	evalTicker := time.NewTicker(c.evalEvery)
 	defer evalTicker.Stop()
@@ -255,10 +259,9 @@ func (c *controller) offlineExpired(gen uint64) {
 	if gen != c.streamGen {
 		return
 	}
+	// Still the current grace: streamUpNow bumps the generation, so the
+	// session has not come back since.
 	c.offlineTimer = nil
-	if c.streamUp {
-		return
-	}
 	c.log.Warn("local session down for %s; marking cooktop data unavailable", c.offlineGrace)
 	c.bridge.SetLink(false)
 }

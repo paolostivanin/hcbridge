@@ -1,9 +1,19 @@
 package main
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"maps"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +23,11 @@ import (
 )
 
 type doneToken struct{ err error }
+
+// lostToken is a publish the broker never acks.
+type lostToken struct{ doneToken }
+
+func (lostToken) WaitTimeout(time.Duration) bool { return false }
 
 func (t doneToken) Wait() bool                     { return true }
 func (t doneToken) WaitTimeout(time.Duration) bool { return true }
@@ -33,6 +48,7 @@ type fakeMQTT struct {
 	mu         sync.Mutex
 	pubs       []pubRec
 	failures   map[string]int // topic -> failures still to inject
+	noAck      map[string]int // topic -> publishes still to leave unacked
 	closeAfter int            // >0: connection reads closed after this many publishes
 	holds      map[string]*heldTopic
 	stall      chan struct{} // non-nil: every Publish blocks until closed, at most stallFor
@@ -100,6 +116,10 @@ func (f *fakeMQTT) Publish(topic string, qos byte, retained bool, payload interf
 	if f.failures[topic] > 0 {
 		f.failures[topic]--
 		return doneToken{err: errors.New("injected failure")}
+	}
+	if f.noAck[topic] > 0 {
+		f.noAck[topic]--
+		return lostToken{}
 	}
 	return doneToken{}
 }
@@ -334,5 +354,225 @@ func TestDiscoveryGivesUpAfterConsecutiveFailures(t *testing.T) {
 	}
 	if got := len(f.published()); got != maxDiscoveryFailures {
 		t.Errorf("%d publishes against a failing broker, want %d (no grinding through every entity)", got, maxDiscoveryFailures)
+	}
+}
+
+// ---- the real paho client against an in-process broker ----------------------
+
+func brokerBridge(t *testing.T, fb *fakeBroker) *Bridge {
+	t.Helper()
+	cfg := testConfig()
+	cfg.MQTT.Host, cfg.MQTT.Port = fb.hostPort()
+	cfg.MQTT.ClientID = "hcbridge-test"
+	cfg.MQTT.Username, cfg.MQTT.Password = "u", "p"
+	b := NewBridge(cfg, deviceMeta{}, quietLogger())
+	if err := b.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Disconnect)
+	return b
+}
+
+func waitRetained(t *testing.T, fb *fakeBroker, topic, value string) {
+	t.Helper()
+	if !waitFor(t, 5*time.Second, func() bool { v, _ := fb.get(topic); return v == value }) {
+		v, ok := fb.get(topic)
+		t.Fatalf("broker has %s = %q (present %v), want %q", topic, v, ok, value)
+	}
+}
+
+// Connect: the link goes out offline before online, then discovery and the
+// state; a broker restart that lost the retained state gets all of it back;
+// Disconnect announces offline last and says goodbye.
+func TestBridgeAgainstABroker(t *testing.T) {
+	fb := newFakeBroker(t)
+	b := brokerBridge(t, fb)
+	root := b.cfg.StateTopic("")
+	waitRetained(t, fb, root+"connected", "online")
+	waitRetained(t, fb, root+"link", "offline")
+	pubs := fb.published()
+	if len(pubs) < 2 || pubs[0].topic != root+"link" || pubs[1].topic != root+"connected" {
+		t.Fatalf("first publishes %+v, want link then connected", pubs[:min(len(pubs), 3)])
+	}
+
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "50"))
+	b.SetLink(true)
+	waitRetained(t, fb, root+"zone/front_left/power", "5")
+	waitRetained(t, fb, root+"link", "online")
+
+	fb.wipe(root + "zone/front_left/power") // the broker restarts without persistence
+	fb.dropAll()
+	waitRetained(t, fb, root+"zone/front_left/power", "5")
+	if c, _ := fb.counts(); c < 2 {
+		t.Fatalf("%d connects, want a reconnect", c)
+	}
+
+	b.Disconnect()
+	waitRetained(t, fb, root+"connected", "offline")
+	if _, d := fb.counts(); d != 1 {
+		t.Fatalf("%d clean disconnects, want 1", d)
+	}
+	b.Disconnect() // a second call is a no-op
+}
+
+func TestClientOptionsTLS(t *testing.T) {
+	cfg := testConfig()
+	cfg.MQTT.Host, cfg.MQTT.TLS, cfg.MQTT.Port = "192.0.2.10", true, 8883
+	cfg.MQTT.Username, cfg.MQTT.Password = "user", "secret"
+	b := NewBridge(cfg, deviceMeta{}, quietLogger())
+
+	cfg.MQTT.CAFile = filepath.Join(t.TempDir(), "ca.pem")
+	os.WriteFile(cfg.MQTT.CAFile, selfSignedPEM(t), 0o600)
+	opts, err := b.clientOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Servers[0].String() != "ssl://192.0.2.10:8883" || opts.TLSConfig == nil || opts.TLSConfig.RootCAs == nil || opts.Username != "user" {
+		t.Fatalf("servers %v tls %+v user %q", opts.Servers, opts.TLSConfig, opts.Username)
+	}
+
+	os.WriteFile(cfg.MQTT.CAFile, []byte("not a certificate"), 0o600)
+	if _, err := b.clientOptions(); err == nil || !strings.Contains(err.Error(), "no PEM certificates") {
+		t.Fatalf("bad CA file: %v", err)
+	}
+	cfg.MQTT.CAFile = ""
+	if opts, err := b.clientOptions(); err != nil || opts.TLSConfig.RootCAs != nil {
+		t.Fatalf("system roots: %v", err)
+	}
+}
+
+func selfSignedPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test CA"},
+		NotBefore: time.Now(), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// While the connection is down the queue waits (coalescing each topic to
+// its newest value; one that changed back is not sent at all), and the next
+// connect sends link and online ahead of it.
+func TestQueueWhileDisconnected(t *testing.T) {
+	b := newTestBridge()
+	f := newFakeMQTT()
+	b.cli = f
+	b.SetLink(true)
+	b.publish("status/x", "1")
+	b.settle(time.Second)
+	f.mu.Lock()
+	f.closeAfter = len(f.pubs) // the connection drops
+	f.mu.Unlock()
+	b.publish("status/x", "2")
+	b.publish("status/x", "1") // changed back: the broker already has it
+	b.publish("status/y", "a")
+	b.SetLink(false)
+	time.Sleep(20 * time.Millisecond)
+	before := len(f.published())
+	if b.settle(10 * time.Millisecond) {
+		t.Fatal("queue drained with the connection down")
+	}
+
+	f.mu.Lock()
+	f.closeAfter = 0 // back
+	f.mu.Unlock()
+	b.kick()
+	b.settle(time.Second)
+	got := f.published()[before:]
+	if n := f.count(b.cfg.StateTopic("status/x")); n != 1 {
+		t.Errorf("status/x published %d times, want once (it changed back)", n)
+	}
+	if len(got) != 2 || got[0].topic != b.cfg.StateTopic("status/y") || got[1].payload != "offline" {
+		t.Errorf("after reconnecting: %+v", got)
+	}
+
+	// A connect with messages still queued puts link and online first.
+	f.mu.Lock()
+	f.closeAfter = len(f.pubs)
+	f.mu.Unlock()
+	b.publish("status/z", "q")
+	b.sendOnce(b.cfg.StateTopic("event/e"), "Present", false)
+	f.mu.Lock()
+	f.closeAfter = 0
+	f.mu.Unlock()
+	before = len(f.published())
+	b.onConnect(f)
+	b.settle(time.Second)
+	got = f.published()[before:]
+	if len(got) < 4 || got[0].topic != b.cfg.StateTopic("link") || got[1].topic != b.cfg.StateTopic("connected") ||
+		got[2].topic != b.cfg.StateTopic("status/z") || got[3].topic != b.cfg.StateTopic("event/e") {
+		t.Errorf("connect with a backlog: %+v", got[:min(len(got), 4)])
+	}
+}
+
+// A publish the broker never acks is sent again.
+func TestUnackedPublishIsSentAgain(t *testing.T) {
+	b := newTestBridge()
+	b.retryWait = 5 * time.Millisecond
+	f := newFakeMQTT()
+	f.noAck = map[string]int{}
+	topic := b.cfg.StateTopic("status/x")
+	f.noAck[topic] = 1
+	b.cli = f
+	b.publish("status/x", "1")
+	if !waitFor(t, 2*time.Second, func() bool { return f.count(topic) == 2 }) {
+		t.Fatalf("published %d times", f.count(topic))
+	}
+}
+
+// New firmware versions republish discovery while connected; the one-shot
+// queue is capped while the broker is away.
+func TestDeviceInfoAndOneShotCap(t *testing.T) {
+	b := newTestBridge()
+	f := newFakeMQTT()
+	b.cli = f
+	if !b.SetDeviceInfo(deviceMeta{SwVersion: "2.17.1"}) {
+		t.Fatal("new firmware not noticed")
+	}
+	topic, _ := discoveryTopicOf(b.cfg, 0)
+	if !waitFor(t, 2*time.Second, func() bool { return f.count(topic) == 1 }) {
+		t.Fatal("discovery not republished")
+	}
+	if b.SetDeviceInfo(deviceMeta{SwVersion: "2.17.1"}) {
+		t.Fatal("unchanged firmware reported as changed")
+	}
+
+	f.mu.Lock()
+	f.closeAfter = len(f.pubs)
+	f.mu.Unlock()
+	for i := 0; i < maxQueuedOneShots+10; i++ {
+		b.sendOnce(b.cfg.StateTopic("event/e"), "Present", false)
+	}
+	b.mu.Lock()
+	n := b.oneShots
+	b.mu.Unlock()
+	if n != maxQueuedOneShots {
+		t.Fatalf("%d one-shots queued, want the cap %d", n, maxQueuedOneShots)
+	}
+}
+
+func TestShutdownEdges(t *testing.T) {
+	// A connect callback that arrives during shutdown does nothing.
+	b := newTestBridge()
+	f := newFakeMQTT()
+	b.cli = f
+	b.Disconnect() // the sender never started
+	b.onConnect(f)
+	if n := len(f.published()); n != 1 || f.published()[0].payload != "offline" {
+		t.Fatalf("published %+v; want only connected=offline", f.published())
+	}
+	newTestBridge().Disconnect() // no client: nothing to do
+
+	// A broken TLS setup fails Connect before any network access.
+	cfg := testConfig()
+	cfg.MQTT.Host, cfg.MQTT.TLS, cfg.MQTT.CAFile = "192.0.2.10", true, "/nonexistent/ca.pem"
+	if err := NewBridge(cfg, deviceMeta{}, quietLogger()).Connect(context.Background()); err == nil {
+		t.Fatal("Connect with a missing CA file")
 	}
 }

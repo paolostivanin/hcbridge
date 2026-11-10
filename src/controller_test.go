@@ -121,6 +121,7 @@ func startController(t *testing.T, srv *hcfake.Server) *ctlHarness {
 	c := newController(cfg, hcfake.Profile(), "0a1b2c3d", b, quietLogger())
 	c.offlineGrace = 50 * time.Millisecond
 	c.evalEvery = 20 * time.Millisecond
+	c.beatEvery, c.aliveEvery = 30*time.Millisecond, 30*time.Millisecond
 	c.link.mon.threshold = 200 * time.Millisecond
 	c.optsHook = func(o *hc.Options) {
 		o.BackoffMin, o.BackoffMax, o.MinDialGap = 20*time.Millisecond, 50*time.Millisecond, 10*time.Millisecond

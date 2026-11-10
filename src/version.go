@@ -12,8 +12,16 @@ var version = "2.0.1"
 // a build from uncommitted changes, which should never be deployed) and the
 // Go toolchain, all read from the build info Go embeds.
 func buildString() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		bi = nil
+	}
+	return describeBuild(version, bi)
+}
+
+func describeBuild(version string, bi *debug.BuildInfo) string {
 	rev, dirty, gover := "unknown", "", "unknown"
-	if bi, ok := debug.ReadBuildInfo(); ok {
+	if bi != nil {
 		gover = bi.GoVersion
 		for _, s := range bi.Settings {
 			switch s.Key {
