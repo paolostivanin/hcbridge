@@ -20,6 +20,7 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang/packets"
 )
 
 type doneToken struct{ err error }
@@ -81,7 +82,7 @@ func (f *fakeMQTT) IsConnected() bool { return f.IsConnectionOpen() }
 func (f *fakeMQTT) IsConnectionOpen() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.closeAfter == 0 || len(f.pubs) < f.closeAfter
+	return f.closeAfter == 0 || len(f.pubs) < f.closeAfter // closeAfter -1: never open
 }
 
 func (f *fakeMQTT) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
@@ -574,5 +575,83 @@ func TestShutdownEdges(t *testing.T) {
 	cfg.MQTT.Host, cfg.MQTT.TLS, cfg.MQTT.CAFile = "192.0.2.10", true, "/nonexistent/ca.pem"
 	if err := NewBridge(cfg, deviceMeta{}, quietLogger()).Connect(context.Background()); err == nil {
 		t.Fatal("Connect with a missing CA file")
+	}
+}
+
+// After a reconnect paho resends what was in flight, in random order; the
+// republish of the current state waits for those to be acknowledged, so
+// the current values land last.
+func TestRepublishWaitsForPahosResend(t *testing.T) {
+	b := newTestBridge()
+	f := newFakeMQTT()
+	b.cli = f
+	b.publish("status/x", "new")
+	b.settle(time.Second)
+	b.store.Open()
+	defer b.store.Close()
+	stale := packets.NewControlPacket(packets.Publish).(*packets.PublishPacket)
+	stale.MessageID = 7
+	b.store.Put("o.7", stale) // in flight when the connection dropped
+
+	done := make(chan struct{})
+	go func() { b.onConnect(f); close(done) }()
+	time.Sleep(100 * time.Millisecond)
+	if n := f.count(b.cfg.StateTopic("status/x")); n != 1 {
+		t.Fatalf("status/x republished %d times while paho's resend was pending", n-1)
+	}
+	b.store.Del("o.7") // the broker acked the resend
+	<-done
+	b.settle(time.Second)
+	if n := f.count(b.cfg.StateTopic("status/x")); n != 2 {
+		t.Fatalf("status/x published %d times, want the republish after the resend", n)
+	}
+}
+
+// Connects that never drain the queue do not pile up clean-up messages and
+// push events out.
+func TestCleanUpsAreQueuedOnce(t *testing.T) {
+	b := newTestBridge()
+	f := newFakeMQTT()
+	f.closeAfter = -1 // never open
+	b.cli = f
+	for i := 0; i < 5; i++ { // what each connect queues
+		b.clearRemoved()
+	}
+	b.mu.Lock()
+	n := b.oneShots
+	b.mu.Unlock()
+	if want := len(removedDiscovery) + len(removedStateTopics); n != want {
+		t.Fatalf("%d one-shots queued after 5 connects, want %d", n, want)
+	}
+	b.sendOnce(b.cfg.StateTopic("event/program_finished"), "Present", false)
+	b.sendOnce(b.cfg.StateTopic("event/program_finished"), "Present", false)
+	b.mu.Lock()
+	n2 := b.oneShots
+	b.mu.Unlock()
+	if n2 != n+2 {
+		t.Fatalf("events are occurrences: both must be queued (%d -> %d)", n, n2)
+	}
+}
+
+// A value held back by the throttle goes out at shutdown, at once.
+func TestHeldValueGoesOutAtShutdown(t *testing.T) {
+	b := newTestBridge()
+	b.throttle["status/program_progress"] = time.Hour
+	f := newFakeMQTT()
+	b.cli = f
+	apply(b, num("BSH.Common.Option.ProgramProgress", 98))
+	b.settle(time.Second)
+	apply(b, num("BSH.Common.Option.ProgramProgress", 99)) // held
+	if b.settle(50 * time.Millisecond) {
+		t.Fatal("99 was not held back")
+	}
+	began := time.Now()
+	b.Disconnect()
+	if d := time.Since(began); d > 900*time.Millisecond {
+		t.Errorf("Disconnect took %s: it waited for the throttle", d)
+	}
+	pubs := f.published()
+	if v, _ := f.last(b.cfg.StateTopic("status/program_progress")); v != "99" || pubs[len(pubs)-1].payload != "offline" {
+		t.Fatalf("progress %q on the broker, last publish %+v", v, pubs[len(pubs)-1])
 	}
 }

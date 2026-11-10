@@ -100,6 +100,8 @@ type Bridge struct {
 	throttle  map[string]time.Duration // throttledSuffixes; a field so tests can shrink it
 	retryWait time.Duration            // publishRetryDelay; a field so tests can shrink it
 
+	store *mqtt.MemoryStore // paho's store of unacknowledged publishes (see storeDrained)
+
 	kickCh   chan struct{} // wakes the sender
 	stopCh   chan struct{} // closed by Disconnect
 	loopDone chan struct{} // closed when the sender has stopped
@@ -136,6 +138,7 @@ func NewBridge(cfg *Config, meta deviceMeta, log *Logger) *Bridge {
 		retryAt:   map[string]time.Time{},
 		throttle:  maps.Clone(throttledSuffixes),
 		retryWait: publishRetryDelay,
+		store:     mqtt.NewMemoryStore(),
 		kickCh:    make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 		loopDone:  make(chan struct{}),
@@ -176,6 +179,7 @@ func (b *Bridge) clientOptions() (*mqtt.ClientOptions, error) {
 		SetKeepAlive(30*time.Second).
 		SetPingTimeout(10*time.Second).
 		SetWriteTimeout(mqttWriteTimeout).
+		SetStore(b.store).
 		SetWill(b.cfg.StateTopic("connected"), "offline", 1, true).
 		SetOnConnectHandler(b.onConnect).
 		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
@@ -253,10 +257,12 @@ func (b *Bridge) onConnect(_ mqtt.Client) {
 	b.clearRemoved()
 
 	// Then the whole desired state, sent even where unchanged: anything lost
-	// by a broker restart is restored. This comes after discovery on purpose:
-	// paho resends the publishes that were in flight when the connection
-	// dropped, concurrently with this callback, and those may be older. Going
-	// last, the current values win.
+	// by a broker restart is restored. paho resends the publishes that were
+	// in flight when the connection dropped, concurrently with this
+	// callback, in random order, and those may be older than the current
+	// values; so this waits until they are acknowledged, and the current
+	// values land last.
+	b.storeDrained(mqttWriteTimeout)
 	b.mu.Lock()
 	if !b.closing {
 		b.requeueAllLocked()
@@ -297,9 +303,10 @@ func (b *Bridge) Disconnect() {
 		b.mu.Unlock()
 		return
 	}
-	b.closing = true // no more reconnect republishing
+	b.closing = true // no more reconnect republishing; held values go now
 	b.mu.Unlock()
 	if b.cli.IsConnectionOpen() {
+		b.kick() // the sender may be asleep until a throttle gap ends
 		b.settle(time.Second)
 	}
 	close(b.stopCh)
@@ -310,6 +317,8 @@ func (b *Bridge) Disconnect() {
 		b.log.Warn("MQTT sender did not stop; announcing offline anyway")
 	}
 	if b.cli.IsConnected() {
+		// A stored "online" that paho resends must not land after this.
+		b.storeDrained(time.Second)
 		tok := b.cli.Publish(b.cfg.StateTopic("connected"), 1, true, "offline")
 		tok.WaitTimeout(2 * time.Second)
 		b.cli.Disconnect(500)
@@ -386,9 +395,20 @@ func (b *Bridge) requeueAllLocked() {
 	}
 }
 
-// sendOnce queues a one-shot publish: no dedup, payload fixed.
+// sendOnce queues a one-shot publish, payload fixed. A retained one (the
+// clean-up of removed topics, queued on every connect) that is already
+// queued is not queued twice, so connects that never get to drain the
+// queue cannot fill the cap and crowd out events.
 func (b *Bridge) sendOnce(topic, payload string, retained bool) {
 	b.mu.Lock()
+	if retained {
+		for _, m := range b.queue {
+			if m.suffix == "" && m.retained && m.topic == topic && m.payload == payload {
+				b.mu.Unlock()
+				return
+			}
+		}
+	}
 	if b.oneShots >= maxQueuedOneShots {
 		b.mu.Unlock()
 		b.log.Warn("MQTT queue full; dropping %s = %s", topic, payload)
@@ -429,12 +449,12 @@ func (b *Bridge) nextLocked(now time.Time) (m outMsg, ok bool, wake time.Time) {
 			delete(b.queued, s)
 			continue
 		}
-		if at := b.retryAt[s]; now.Before(at) {
+		if at := b.retryAt[s]; now.Before(at) && !b.closing {
 			hold(at)
 			i++
 			continue
 		}
-		if gap, throttled := b.throttle[s]; throttled && had && !forced {
+		if gap, throttled := b.throttle[s]; throttled && had && !forced && !b.closing {
 			edge := prev == "0" || payload == "0" || prev == noValue || payload == noValue
 			if until := b.lastAt[s].Add(gap); !edge && now.Before(until) {
 				hold(until)
@@ -603,6 +623,24 @@ func (b *Bridge) waitHandedOver(d time.Duration, suffixes ...string) {
 			return
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// storeDrained waits until paho holds no unacknowledged publish, up to d.
+func (b *Bridge) storeDrained(d time.Duration) {
+	deadline := time.Now().Add(d)
+	for {
+		pending := false
+		for _, k := range b.store.All() {
+			if strings.HasPrefix(k, "o.") { // paho's outbound keys
+				pending = true
+				break
+			}
+		}
+		if !pending || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
