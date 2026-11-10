@@ -9,10 +9,16 @@ import (
 // linkMonitor turns the client's link states into the power_cycle_needed
 // signal. The hob's firmware sometimes refuses every local session (HTTP
 // 503 on the upgrade) until it is power cycled; once the link has been
-// refused continuously for the threshold, the flag latches on. It stays on
-// through "unreachable" (what the breaker being off looks like) and clears
-// only when a session connects, so "on" means "go flip the breaker" and
-// "off again" means "it worked".
+// refused for the threshold, the flag latches on. It stays on through
+// "unreachable" (what the breaker being off looks like) and clears only
+// when a session connects, so "on" means "go flip the breaker" and "off
+// again" means "it worked".
+//
+// What counts is refusal without a session in between. An "error" attempt
+// (a dropped or garbled upgrade answer, a timeout) and "connecting" say
+// nothing about whether the firmware still refuses, so they neither end nor
+// restart the episode; the flag only latches while the state is refused.
+// "unreachable" (the hob is off the network) and a key error do restart it.
 type linkMonitor struct {
 	threshold    time.Duration
 	state        hc.LinkState
@@ -31,6 +37,8 @@ func (m *linkMonitor) update(st hc.LinkStatus) {
 	case hc.LinkConnected:
 		m.refusedSince = time.Time{}
 		m.latched = false
+	case hc.LinkError, hc.LinkConnecting:
+		// Neutral: the episode carries on.
 	default:
 		m.refusedSince = time.Time{}
 	}

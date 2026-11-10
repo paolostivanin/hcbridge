@@ -35,7 +35,8 @@ type Config struct {
 
 	Link struct {
 		// PowerCycleAfter: how long the hob may refuse local connections
-		// (HTTP 503) before power_cycle_needed turns on.
+		// (HTTP 503, with no session in between; failed attempts of other
+		// kinds don't restart the clock) before power_cycle_needed turns on.
 		PowerCycleAfter time.Duration `yaml:"power_cycle_after"`
 	} `yaml:"link"`
 

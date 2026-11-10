@@ -150,7 +150,9 @@ connection:
 When the hob refuses anyway, `sensor.cooktop_local_link` turns `refused` and,
 after `link.power_cycle_after` (30 min), `binary_sensor.cooktop_power_cycle_needed`
 turns on (see the automation in [chapter 9](#9-home-assistant-automations)).
-It clears when a session connects again.
+It clears when a session connects again. Failed attempts of other kinds in
+between (a dropped or garbled answer, a timeout) don't restart the clock; the
+hob dropping off the network does.
 
 Do not run another local client (hcpy, the Home Connect Local integration)
 against the same hob, and do not probe its port 80 with nc or curl.
@@ -271,7 +273,7 @@ version, then "connected to ... appliance <version>, network module
 | `mqtt.client_id` | `hcbridge-<hostname>` | must be unique per running bridge |
 | `mqtt.discovery_topic` | `homeassistant` | HA's discovery prefix |
 | `mqtt.tls`, `mqtt.ca_file` | `false`, - | TLS 1.2+ to the broker; CA for its certificate |
-| `link.power_cycle_after` | `30m` (min `1m`) | continuous HTTP 503 refusals before `power_cycle_needed` turns on |
+| `link.power_cycle_after` | `30m` (min `1m`) | HTTP 503 refusals with no session in between before `power_cycle_needed` turns on |
 | `state_dir` | `/var/lib/hcbridge` | device ID, lock, link episode, device info, liveness file |
 | `logfile` | stdout | log file (rotated); empty logs to stdout |
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARN` or `ERROR` |
