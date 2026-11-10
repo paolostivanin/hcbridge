@@ -6,7 +6,7 @@ import (
 )
 
 // version is the release version. Bump it with every change that is deployed.
-var version = "2.0.1"
+var version = "2.0.2"
 
 // buildString describes the binary: version, VCS revision (with "-dirty" for
 // a build from uncommitted changes, which should never be deployed) and the
