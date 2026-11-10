@@ -312,6 +312,51 @@ func TestMandatoryValuesRetryAndError(t *testing.T) {
 	}
 }
 
+// A snapshot that fails at connect is read again soon on the same socket
+// (no redial), backing off, and once it succeeds the retries stop.
+func TestFailedSnapshotIsRetriedOnTheSameSession(t *testing.T) {
+	srv := newServer(t)
+	srv.FailMandatory(500, false)
+	reads := func() int {
+		n := 0
+		for _, m := range srv.Received() {
+			if m.Resource == "/ro/allMandatoryValues" {
+				n++
+			}
+		}
+		return n
+	}
+	h := start(t, srv, func(o *hc.Options) {
+		o.SnapshotRetryMin, o.SnapshotRetryMax = 20*time.Millisecond, 40*time.Millisecond
+	})
+	h.rec.waitLink(t, hc.LinkConnected, 1)
+	waitFor(t, 2*time.Second, "two retries", func() bool { return reads() >= 3 })
+	if len(valueEvents(h.rec)) != 0 {
+		t.Fatal("values from a failed snapshot")
+	}
+	srv.SetValues(map[int]any{4409: 18})
+	srv.FailMandatory(0, false)
+	waitFor(t, 2*time.Second, "the retried snapshot", func() bool {
+		for _, ev := range valueEvents(h.rec) {
+			if ev.Snapshot && len(ev.Values) > 0 {
+				return true
+			}
+		}
+		return false
+	})
+	if srv.Sessions() != 1 || len(srv.DialTimes()) != 1 {
+		t.Fatalf("sessions %d, dials %d: the retry must use the live session", srv.Sessions(), len(srv.DialTimes()))
+	}
+	n := reads()
+	time.Sleep(200 * time.Millisecond)
+	if reads() != n {
+		t.Fatalf("still reading after a good snapshot: %d -> %d", n, reads())
+	}
+	if !h.log.has("continuing without a snapshot") || !h.log.has("full read succeeded") {
+		t.Fatal("failure and recovery not logged")
+	}
+}
+
 func TestMalformedMessageKeepsSession(t *testing.T) {
 	srv := newServer(t)
 	h := start(t, srv, nil)

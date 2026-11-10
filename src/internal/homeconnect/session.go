@@ -344,8 +344,8 @@ func (s *session) notify(resource string, version int) error {
 }
 
 // handshake answers the appliance's /ei/initialValues and walks the
-// session setup: services, authentication, device info, readiness, the
-// description changes, and finally the full value snapshot.
+// session setup: services, authentication, device info, readiness and the
+// description changes. The full value snapshot follows (snapshot).
 func (s *session) handshake(ctx context.Context, init *Message) (*DeviceInfo, error) {
 	var ed struct {
 		EdMsgID flexInt `json:"edMsgID"`
@@ -445,8 +445,15 @@ func (s *session) handshake(ctx context.Context, init *Message) (*DeviceInfo, er
 	if _, err := s.get(ctx, "/ro/allDescriptionChanges", s.version("/ro"), nil); tolerate(err) != nil {
 		return nil, err
 	}
-	// The snapshot. Some firmware answers 500 or is slow here; one retry on
-	// timeout, and a 500 leaves the session up (pushes still arrive).
+	return info, nil
+}
+
+// snapshot reads every value (/ro/allMandatoryValues; dispatch emits them
+// ahead of anything pushed later). Some firmware answers 500 or is slow
+// here: one retry on timeout, and an error answer leaves the session up
+// (pushes still arrive) but comes back as failed, so the caller reads again
+// soon. Any other failure (err) ends the session.
+func (s *session) snapshot(ctx context.Context) (failed, err error) {
 	for attempt := 0; ; attempt++ {
 		_, err := s.get(ctx, "/ro/allMandatoryValues", s.version("/ro"), nil)
 		var te *TimeoutError
@@ -456,15 +463,10 @@ func (s *session) handshake(ctx context.Context, init *Message) (*DeviceInfo, er
 		}
 		var re *RequestError
 		if errors.As(err, &re) {
-			s.c.log.Warn("%v; continuing without a snapshot", err)
-			break
+			return err, nil
 		}
-		if err != nil {
-			return nil, err
-		}
-		break
+		return nil, err
 	}
-	return info, nil
 }
 
 func str(v any) string {

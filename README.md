@@ -64,7 +64,9 @@ from a one-time download from the Home Connect account (see
 
 The bridge keeps **one** session open around the clock. The hob pushes every
 change within milliseconds: each zone's level, state and timer, the fan, the
-program state. A full snapshot is read on every connect and every 6 hours.
+program state. A full snapshot is read on every connect and every 6 hours; if
+the hob answers it with an error, it is read again on the same session after
+5 s, backing off to 5 min, until it succeeds.
 
 ## 3. Home Assistant entities
 

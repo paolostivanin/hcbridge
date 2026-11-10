@@ -41,6 +41,10 @@ type Options struct {
 	MinDialGap     time.Duration // never dial more often than this (5 s)
 	KeyErrorAfter  int           // first-frame MAC failures in a row before key_error (3)
 	ResyncEvery    time.Duration // re-read all values on the live session (6 h; <0 disables)
+	// After a failed full read (at connect or a resync) it is retried on the
+	// same session from SnapshotRetryMin, doubling up to SnapshotRetryMax.
+	SnapshotRetryMin time.Duration // 5 s
+	SnapshotRetryMax time.Duration // 5 min
 
 	// NotBefore delays the first dial (carried over from a previous run so
 	// a restart loop cannot hammer the appliance).
@@ -76,6 +80,8 @@ func (o *Options) setDefaults() {
 	def(&o.StableAfter, 60*time.Second)
 	def(&o.MinDialGap, 5*time.Second)
 	def(&o.ResyncEvery, 6*time.Hour)
+	def(&o.SnapshotRetryMin, 5*time.Second)
+	def(&o.SnapshotRetryMax, 5*time.Minute)
 	if o.KeyErrorAfter == 0 {
 		o.KeyErrorAfter = 3
 	}
@@ -289,7 +295,14 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 		s.closeGracefully(1000, "")
 		return time.Time{}, ctx.Err()
 	}
-	info, err := s.handshake(sctx, init)
+	setup := func(init *Message) (info *DeviceInfo, snapFailed, err error) {
+		if info, err = s.handshake(sctx, init); err != nil {
+			return nil, nil, err
+		}
+		snapFailed, err = s.snapshot(sctx)
+		return info, snapFailed, err
+	}
+	info, snapFailed, err := setup(init)
 	if err != nil {
 		s.end()
 		if errors.Is(err, ErrFirstFrameMAC) || errors.Is(err, ErrDesync) {
@@ -303,12 +316,37 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 
 	pingErr := make(chan error, 1)
 	go s.pingLoop(sctx, pingErr)
-	var resync <-chan time.Time
-	if c.opts.ResyncEvery > 0 {
-		t := time.NewTicker(c.opts.ResyncEvery)
-		defer t.Stop()
-		resync = t.C
+
+	// The next full read: ResyncEvery after a good one. After a failed one
+	// (the snapshot at connect included) soon, backing off, on this same
+	// session: values that changed while the bridge was away must not stay
+	// stale until the next push or for hours.
+	resync := time.NewTimer(time.Hour)
+	resync.Stop()
+	defer resync.Stop()
+	retry, failures := c.opts.SnapshotRetryMin, 0
+	schedule := func(failed error) {
+		if failed == nil {
+			if failures > 0 {
+				c.log.Info("full read succeeded after %d failed attempts", failures)
+			}
+			retry, failures = c.opts.SnapshotRetryMin, 0
+			if c.opts.ResyncEvery > 0 {
+				resync.Reset(c.opts.ResyncEvery)
+			}
+			return
+		}
+		d := applyJitter(retry, c.opts.jitter())
+		retry = nextBackoff(retry, c.opts.SnapshotRetryMax)
+		failures++
+		if failures == 1 {
+			c.log.Warn("%v; continuing without a snapshot, retrying in %s (backing off to %s)", failed, d.Round(time.Millisecond), c.opts.SnapshotRetryMax)
+		} else {
+			c.log.Debug("%v; full read retry %d in %s", failed, failures, d.Round(time.Millisecond))
+		}
+		resync.Reset(d)
 	}
+	schedule(snapFailed)
 	for {
 		select {
 		case <-ctx.Done():
@@ -323,22 +361,23 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 		case m := <-s.initCh:
 			// The appliance restarted the handshake on the same socket.
 			c.log.Warn("appliance re-sent /ei/initialValues; redoing the handshake")
-			info, err := s.handshake(sctx, m)
+			info, snapFailed, err := setup(m)
 			if err != nil {
 				s.closeGracefully(1000, "")
 				return connectedAt, fmt.Errorf("re-handshake: %w", err)
 			}
 			c.emit(Event{Kind: EvInfo, Info: info})
-		case <-resync:
-			if _, err := s.get(sctx, "/ro/allMandatoryValues", s.version("/ro"), nil); err != nil {
-				var re *RequestError
-				var te *TimeoutError
-				if !errors.As(err, &re) && !errors.As(err, &te) {
-					s.closeGracefully(1000, "")
-					return connectedAt, fmt.Errorf("resync: %w", err)
-				}
-				c.log.Warn("periodic resync: %v", err)
+			resync.Stop()
+			schedule(snapFailed)
+		case <-resync.C:
+			_, err := s.get(sctx, "/ro/allMandatoryValues", s.version("/ro"), nil)
+			var re *RequestError
+			var te *TimeoutError
+			if err != nil && !errors.As(err, &re) && !errors.As(err, &te) {
+				s.closeGracefully(1000, "")
+				return connectedAt, fmt.Errorf("resync: %w", err)
 			}
+			schedule(err) // an error answer or a timeout: read again soon
 		}
 	}
 }
