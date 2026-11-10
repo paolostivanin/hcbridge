@@ -94,7 +94,14 @@ func NewBridge(cfg *Config, meta deviceMeta, log *Logger) *Bridge {
 	return b
 }
 
-func (b *Bridge) Connect(ctx context.Context) error {
+// maxReconnectInterval caps paho's reconnect backoff (1 s, 2 s, 4 s, ...).
+// The library default is 10 minutes: after a broker outage of that length the
+// bridge could sleep that long past the broker coming back, leaving HA stale.
+const maxReconnectInterval = 30 * time.Second
+
+// clientOptions builds the MQTT client configuration: one persistent session
+// with a retained last will, auto-reconnect with a capped backoff.
+func (b *Bridge) clientOptions() (*mqtt.ClientOptions, error) {
 	scheme := "tcp"
 	if b.cfg.MQTT.TLS {
 		scheme = "ssl"
@@ -103,6 +110,7 @@ func (b *Bridge) Connect(ctx context.Context) error {
 		AddBroker(fmt.Sprintf("%s://%s:%d", scheme, b.cfg.MQTT.Host, b.cfg.MQTT.Port)).
 		SetClientID(b.cfg.MQTT.ClientID).
 		SetAutoReconnect(true).
+		SetMaxReconnectInterval(maxReconnectInterval).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5*time.Second).
 		SetCleanSession(false).
@@ -122,15 +130,23 @@ func (b *Bridge) Connect(ctx context.Context) error {
 		if b.cfg.MQTT.CAFile != "" {
 			pem, err := os.ReadFile(b.cfg.MQTT.CAFile)
 			if err != nil {
-				return fmt.Errorf("read mqtt.ca_file: %w", err)
+				return nil, fmt.Errorf("read mqtt.ca_file: %w", err)
 			}
 			pool := x509.NewCertPool()
 			if !pool.AppendCertsFromPEM(pem) {
-				return fmt.Errorf("mqtt.ca_file %s: no PEM certificates found", b.cfg.MQTT.CAFile)
+				return nil, fmt.Errorf("mqtt.ca_file %s: no PEM certificates found", b.cfg.MQTT.CAFile)
 			}
 			tc.RootCAs = pool
 		}
 		opts.SetTLSConfig(tc)
+	}
+	return opts, nil
+}
+
+func (b *Bridge) Connect(ctx context.Context) error {
+	opts, err := b.clientOptions()
+	if err != nil {
+		return err
 	}
 	b.cli = mqtt.NewClient(opts)
 	tok := b.cli.Connect()
@@ -149,7 +165,15 @@ func (b *Bridge) Connect(ctx context.Context) error {
 
 func (b *Bridge) onConnect(_ mqtt.Client) {
 	b.log.Info("MQTT connected to %s:%d", b.cfg.MQTT.Host, b.cfg.MQTT.Port)
-	b.publish("connected", "online")
+	// First, and not through publish(): its dedup sees "online" from the last
+	// connect and would swallow it, leaving it to the republish loop at the
+	// end. HA keeps the entities unavailable (the broker may have fired the
+	// last will) until this arrives, so it must not wait behind discovery.
+	b.mu.Lock()
+	b.lastPub["connected"] = "online"
+	delete(b.failed, "connected")
+	b.mu.Unlock()
+	b.send(b.cfg.StateTopic("connected"), "online", true, b.onFail("connected", "online"))
 
 	b.publishDiscovery()
 	b.clearRemoved()

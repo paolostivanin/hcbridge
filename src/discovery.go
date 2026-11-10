@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -294,15 +295,26 @@ func discoveryPayload(cfg *Config, meta deviceMeta, e discoveryEntity) map[strin
 	return p
 }
 
+// maxDiscoveryFailures: consecutive failed publishes after which a discovery
+// pass gives up. Each publish may wait publishTimeout for an ack, so an
+// unresponsive broker must not be ground through 32 times.
+const maxDiscoveryFailures = 3
+
 // PublishDiscovery emits Home Assistant MQTT discovery configs for all entities.
 // Topics: homeassistant/<component>/hcbridge_<slug>/<object_id>/config (retained).
 // All entities share the same `device` block so HA groups them.
+//
+// One failed entity does not stop the others: the pass carries on, and what
+// failed is retried once. It stops early when the connection is gone or the
+// broker keeps failing; whatever is missing is published again by the next
+// connect.
 func PublishDiscovery(cfg *Config, meta deviceMeta, cli mqtt.Client, log *Logger) error {
 	if cli == nil {
 		return nil
 	}
 	entities := discoveryEntities(cfg)
-	for _, e := range entities {
+	published := 0
+	publishOne := func(e discoveryEntity) error {
 		body, err := json.Marshal(discoveryPayload(cfg, meta, e))
 		if err != nil {
 			return fmt.Errorf("marshal discovery for %s: %w", e.objectID, err)
@@ -314,7 +326,37 @@ func PublishDiscovery(cfg *Config, meta deviceMeta, cli mqtt.Client, log *Logger
 		if err := t.Error(); err != nil {
 			return fmt.Errorf("publish discovery for %s: %w", e.objectID, err)
 		}
+		published++
+		return nil
 	}
-	log.Info("MQTT discovery published (%d entities)", len(entities))
-	return nil
+	// pass publishes list and returns what failed; aborted means it stopped
+	// early (connection lost, or too many failures in a row).
+	pass := func(list []discoveryEntity) (failed []discoveryEntity, errs []error, aborted bool) {
+		consecutive := 0
+		for _, e := range list {
+			if !cli.IsConnectionOpen() {
+				return failed, append(errs, errors.New("MQTT connection lost during discovery")), true
+			}
+			if err := publishOne(e); err != nil {
+				failed, errs = append(failed, e), append(errs, err)
+				if consecutive++; consecutive >= maxDiscoveryFailures {
+					return failed, append(errs, fmt.Errorf("giving up after %d failures in a row", consecutive)), true
+				}
+				continue
+			}
+			consecutive = 0
+		}
+		return failed, errs, false
+	}
+
+	failed, errs, aborted := pass(entities)
+	if len(failed) > 0 && !aborted {
+		failed, errs, _ = pass(failed) // one retry; only what still fails is reported
+	}
+	if len(errs) == 0 {
+		log.Info("MQTT discovery published (%d entities)", published)
+		return nil
+	}
+	log.Warn("MQTT discovery: %d of %d entities published (the rest follow on the next connect)", published, len(entities))
+	return errors.Join(errs...)
 }
