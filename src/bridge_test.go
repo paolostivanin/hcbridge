@@ -211,21 +211,61 @@ func TestPowerOffResets(t *testing.T) {
 	want(t, b, "status/fan_level", "3") // the fan is the hob's to report (after-run)
 }
 
+// sent returns the payloads a dry-run bridge printed for suffix, in order.
+func sent(b *Bridge, out *syncBuffer, suffix string) []string {
+	topic := b.cfg.StateTopic(suffix)
+	var vals []string
+	for _, l := range strings.Split(out.String(), "\n") {
+		f := strings.SplitN(l, " = ", 2)
+		if len(f) != 2 || !strings.HasSuffix(strings.TrimSpace(f[0]), " "+topic) {
+			continue
+		}
+		vals = append(vals, strings.TrimSuffix(f[1], " [retained]"))
+	}
+	return vals
+}
+
 func TestThrottledTopics(t *testing.T) {
 	b := newTestBridge()
+	const suffix = "status/elapsed_program_time"
+	b.throttle[suffix] = time.Hour // nothing held back gets out during the test
+	out := capture(b)
 	tick := func(s float64) { apply(b, num("BSH.Common.Option.ElapsedProgramTime", s)) }
 	tick(0)
 	tick(1) // from zero: at once
-	want(t, b, "status/elapsed_program_time", "1")
 	tick(2) // within the gap: held back
-	want(t, b, "status/elapsed_program_time", "1")
-	b.mu.Lock()
-	b.lastAt["status/elapsed_program_time"] = time.Now().Add(-time.Minute)
-	b.mu.Unlock()
-	tick(3)
-	want(t, b, "status/elapsed_program_time", "3")
-	tick(0) // back to zero: at once
-	want(t, b, "status/elapsed_program_time", "0")
+	tick(3) // replaces the held-back 2
+	if got := strings.Join(sent(b, out, suffix), ","); got != "0,1" {
+		t.Fatalf("sent %s, want 0,1 (2 and 3 held back)", got)
+	}
+	want(t, b, suffix, "3") // the desired state is current all the same
+	// Back to zero, then no value, then a value again: each at once.
+	tick(0)
+	b.ApplyValues([]hc.Value{{UID: 1, Name: "BSH.Common.Option.ElapsedProgramTime"}}, false)
+	tick(5)
+	if got := strings.Join(sent(b, out, suffix), ","); got != "0,1,0,None,5" {
+		t.Fatalf("sent %s, want 0,1,0,None,5", got)
+	}
+}
+
+// The last value inside the throttle gap is delivered when the gap ends,
+// with no further input: progress must not stick at 99 when the hob's
+// final 100 arrives within the gap.
+func TestThrottledTopicDeliversTheFinalValue(t *testing.T) {
+	b := newTestBridge()
+	const suffix = "status/program_progress"
+	b.throttle[suffix] = 80 * time.Millisecond
+	out := capture(b)
+	prog := func(v float64) { apply(b, num("BSH.Common.Option.ProgramProgress", v)) }
+	prog(98)
+	prog(99)
+	prog(100)
+	if got := strings.Join(sent(b, out, suffix), ","); got != "98" {
+		t.Fatalf("sent %s inside the gap, want 98", got)
+	}
+	if !waitFor(t, 2*time.Second, func() bool { return strings.Join(sent(b, out, suffix), ",") == "98,100" }) {
+		t.Fatalf("sent %v, want 98 then the final 100", sent(b, out, suffix))
+	}
 }
 
 func TestUnknownAndIgnoredKeys(t *testing.T) {
@@ -249,17 +289,25 @@ func TestPublishLink(t *testing.T) {
 	want(t, b, "status/power_cycle_needed", "true")
 }
 
-func TestFailedPublishIsRetried(t *testing.T) {
+func TestFailedPublishIsSentAgain(t *testing.T) {
 	b := newTestBridge()
+	b.retryWait = 10 * time.Millisecond
+	f := newFakeMQTT()
+	b.cli = f
+	topic := b.cfg.StateTopic("status/x")
+	f.failures[topic] = 1 // the broker never acks the first one
 	if !b.publish("status/x", "1") {
 		t.Fatal("first publish skipped")
+	}
+	if !waitFor(t, 2*time.Second, func() bool { return f.count(topic) == 2 }) {
+		t.Fatalf("published %d times, want the failed one sent again", f.count(topic))
 	}
 	if b.publish("status/x", "1") {
 		t.Fatal("unchanged value republished")
 	}
-	b.onFail("status/x", "1")() // the broker never acked it
-	if !b.publish("status/x", "1") {
-		t.Fatal("value from a failed publish was deduped")
+	b.settle(time.Second)
+	if n := f.count(topic); n != 2 {
+		t.Fatalf("published %d times, want 2", n)
 	}
 }
 
@@ -389,6 +437,7 @@ func TestOnlyRemovedTopicsGetAnEmptyRetainedPayload(t *testing.T) {
 	f := newFakeMQTT()
 	b.cli = f
 	b.onConnect(f)
+	b.settle(time.Second)
 
 	allowed := map[string]bool{}
 	for _, d := range removedDiscovery {

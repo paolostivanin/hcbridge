@@ -327,12 +327,17 @@ Update anything in HA that used the removed entities
   redialling) and the last device info (`device.json`: the firmware in HA
   before the first connect).
 - **MQTT**: auto-reconnect (backoff capped at 30 s) with a last will
-  (`connected = offline`), which the bridge counters with `online` first on every
-  connect; the full
-  retained state is republished on every reconnect, and a publish that was not
-  acknowledged is retried on the next update. The first broker connection may
-  take as long as it needs (no exit on a boot race). Values the hob pushes
-  every second (elapsed time, progress) are published at most every 15 s.
+  (`connected = offline`), which the bridge counters on every connect with the
+  hob link and then `online`, before anything else. On a cold start the link
+  is `offline` until the session with the hob is up, so HA never shows the
+  previous run's retained values as current. The full retained state is
+  republished on every reconnect. All publishes go through one sender that
+  always sends a topic's newest value, so a republish cannot overwrite a newer
+  value, and the hob's session never waits on a slow broker (writes time out
+  after 5 s). A publish that is not acknowledged is sent again. The first
+  broker connection may take as long as it needs (no exit on a boot race).
+  Values the hob pushes every second (elapsed time, progress) are published
+  at most every 15 s; the last one is always delivered.
 - **Process**: under OpenRC `supervise-daemon` (see `openrc/hcbridge`) the
   bridge is restarted if it exits, and the healthcheck restarts it if the main
   loop stops refreshing `<state_dir>/alive`. A hob refusing connections does

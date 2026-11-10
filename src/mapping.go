@@ -30,7 +30,9 @@ var keyToSuffix = map[string]string{
 // throttledSuffixes are published at most this often while they change.
 // The hob pushes elapsed time and progress every second while a program
 // runs; every tick as a retained publish only churns the broker and HA's
-// recorder. A change to or from zero always goes out at once.
+// recorder. A change to or from zero or "no value" always goes out at once,
+// and the newest value held back goes out when the gap ends, so the last
+// one (progress 100) is never lost.
 var throttledSuffixes = map[string]time.Duration{
 	"status/elapsed_program_time": 15 * time.Second,
 	"status/program_progress":     15 * time.Second,

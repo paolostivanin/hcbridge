@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -33,9 +34,32 @@ type fakeMQTT struct {
 	pubs       []pubRec
 	failures   map[string]int // topic -> failures still to inject
 	closeAfter int            // >0: connection reads closed after this many publishes
+	holds      map[string]*heldTopic
+	stall      chan struct{} // non-nil: every Publish blocks until closed, at most stallFor
+	stallFor   time.Duration
 }
 
-func newFakeMQTT() *fakeMQTT { return &fakeMQTT{failures: map[string]int{}} }
+// heldTopic blocks the next Publish of a topic until released.
+type heldTopic struct {
+	entered, release chan struct{}
+}
+
+func newFakeMQTT() *fakeMQTT {
+	return &fakeMQTT{failures: map[string]int{}, holds: map[string]*heldTopic{}}
+}
+
+// hold makes the next Publish of topic block until release is called;
+// entered closes when that Publish has started.
+func (f *fakeMQTT) hold(topic string) (entered <-chan struct{}, release func()) {
+	h := &heldTopic{entered: make(chan struct{}), release: make(chan struct{})}
+	f.mu.Lock()
+	f.holds[topic] = h
+	f.mu.Unlock()
+	var once sync.Once
+	return h.entered, func() { once.Do(func() { close(h.release) }) }
+}
+
+func (f *fakeMQTT) Disconnect(uint) {}
 
 func (f *fakeMQTT) IsConnected() bool { return f.IsConnectionOpen() }
 func (f *fakeMQTT) IsConnectionOpen() bool {
@@ -45,6 +69,22 @@ func (f *fakeMQTT) IsConnectionOpen() bool {
 }
 
 func (f *fakeMQTT) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
+	f.mu.Lock()
+	h := f.holds[topic]
+	delete(f.holds, topic)
+	stall, stallFor := f.stall, f.stallFor
+	f.mu.Unlock()
+	if h != nil {
+		close(h.entered)
+		<-h.release
+	}
+	if stall != nil { // like paho with a write timeout: blocks, then fails
+		select {
+		case <-stall:
+		case <-time.After(stallFor):
+			return doneToken{err: errors.New("publish was broken by timeout")}
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var p string
@@ -68,6 +108,17 @@ func (f *fakeMQTT) published() []pubRec {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]pubRec(nil), f.pubs...)
+}
+
+// last returns the last payload published to topic.
+func (f *fakeMQTT) last(topic string) (string, bool) {
+	pubs := f.published()
+	for i := len(pubs) - 1; i >= 0; i-- {
+		if pubs[i].topic == topic {
+			return pubs[i].payload, true
+		}
+	}
+	return "", false
 }
 
 func (f *fakeMQTT) count(topic string) int {
@@ -96,6 +147,9 @@ func TestClientOptions(t *testing.T) {
 	if !opts.AutoReconnect || !opts.ConnectRetry || opts.CleanSession || opts.KeepAlive != 30 {
 		t.Errorf("auto-reconnect %v, connect-retry %v, clean session %v, keepalive %ds", opts.AutoReconnect, opts.ConnectRetry, opts.CleanSession, opts.KeepAlive)
 	}
+	if opts.WriteTimeout != mqttWriteTimeout {
+		t.Errorf("WriteTimeout = %s, want %s (paho's default blocks a publish 30 s and never times out a socket write)", opts.WriteTimeout, mqttWriteTimeout)
+	}
 	if !opts.WillEnabled || opts.WillTopic != "homeconnect/cooktop/connected" || string(opts.WillPayload) != "offline" || !opts.WillRetained || opts.WillQos != 1 {
 		t.Errorf("last will %v %q %q retained=%v qos=%d", opts.WillEnabled, opts.WillTopic, opts.WillPayload, opts.WillRetained, opts.WillQos)
 	}
@@ -111,20 +165,103 @@ func TestClientOptions(t *testing.T) {
 
 // ---- "online" first (fix: the dedup swallowed it on reconnect) -------------
 
+// The hob link goes first, then online: on a cold start the link is offline
+// until the session is up, and HA must see that before connected=online, or
+// it shows the previous run's retained values as current.
 func TestOnlineAnnouncedFirstOnEveryConnect(t *testing.T) {
 	b := newTestBridge()
 	f := newFakeMQTT()
 	b.cli = f
+	b.SetLink(false) // what Connect queues before the first connect
+	b.settle(time.Second)
 	for i := 0; i < 3; i++ { // the first connect, then two reconnects with the dedup state kept
 		before := len(f.published())
 		b.onConnect(f)
+		b.settle(time.Second)
 		got := f.published()[before:]
-		if len(got) == 0 {
-			t.Fatalf("connect %d: nothing published", i)
+		if len(got) < 2 {
+			t.Fatalf("connect %d: published %+v", i, got)
 		}
-		if first := got[0]; first.topic != "homeconnect/cooktop/connected" || first.payload != "online" || !first.retained || first.qos != 1 {
-			t.Fatalf("connect %d: first publish is %+v, want connected=online (retained, QoS 1) before anything else", i, first)
+		if l := got[0]; l.topic != "homeconnect/cooktop/link" || l.payload != "offline" || !l.retained || l.qos != 1 {
+			t.Fatalf("connect %d: first publish is %+v, want link=offline (retained, QoS 1)", i, l)
 		}
+		if c := got[1]; c.topic != "homeconnect/cooktop/connected" || c.payload != "online" || !c.retained || c.qos != 1 {
+			t.Fatalf("connect %d: second publish is %+v, want connected=online (retained, QoS 1) before discovery", i, c)
+		}
+	}
+}
+
+// ---- one sender, newest value last (fix: the replay overwrote newer values) -
+
+// The reconnect republish runs while the hob keeps pushing. A value that
+// changes while the republish is on its way must end up on the broker, not
+// be overwritten by the republished old one (which the dedup would then
+// never correct).
+func TestReplayCannotOverwriteANewerValue(t *testing.T) {
+	b := newTestBridge()
+	f := newFakeMQTT()
+	b.cli = f
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"),
+		sym("Cooking.Hob.Status.Zone.100.State", "Active"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "50"))
+	b.SetLink(true)
+	b.settle(time.Second)
+
+	power := b.cfg.StateTopic("zone/front_left/power")
+	entered, release := f.hold(power)
+	defer release()
+	done := make(chan struct{})
+	go func() { b.onConnect(f); close(done) }() // a broker reconnect
+	select {
+	case <-entered: // the republished "5" is on its way
+	case <-time.After(2 * time.Second):
+		t.Fatal("republish never reached the zone power")
+	}
+	apply(b, sym("Cooking.Hob.Status.Zone.100.PowerLevel", "Off"), sym("Cooking.Hob.Status.Zone.100.State", "Off"))
+	b.SetLink(false)
+	release()
+	<-done
+	if !b.settle(2 * time.Second) {
+		t.Fatal("queue never drained")
+	}
+	b.mu.Lock()
+	desired := maps.Clone(b.lastPub)
+	b.mu.Unlock()
+	for suffix, v := range desired {
+		if got, _ := f.last(b.cfg.StateTopic(suffix)); got != v {
+			t.Errorf("broker has %s = %q, desired %q", suffix, got, v)
+		}
+	}
+	if got, _ := f.last(power); got != "off" {
+		t.Fatalf("zone power on the broker = %q, want off", got)
+	}
+}
+
+// A broker that stops reading must not hold up the hob's values (a full
+// event queue stops the session's read loop, and with it the pongs), and
+// shutting down must stay bounded.
+func TestStalledBrokerDoesNotBlockTheHob(t *testing.T) {
+	b := newTestBridge()
+	f := newFakeMQTT()
+	f.stall, f.stallFor = make(chan struct{}), 300*time.Millisecond
+	defer close(f.stall)
+	b.cli = f
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 2000; i++ {
+			apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", float64(100+10*i)),
+				sym("BSH.Common.Event.ProgramFinished", "Present"))
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("applying values waited on the stalled broker")
+	}
+	start := time.Now()
+	b.Disconnect()
+	if d := time.Since(start); d > 4*time.Second {
+		t.Fatalf("Disconnect took %s against a stalled broker", d)
 	}
 }
 

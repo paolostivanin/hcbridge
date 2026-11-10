@@ -6,7 +6,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,7 +19,19 @@ import (
 	hc "hcbridge/src/internal/homeconnect"
 )
 
-const publishTimeout = 30 * time.Second
+const (
+	// publishTimeout is how long a QoS 1 publish may wait for the broker's
+	// ack before it counts as failed (and the value is sent again).
+	publishTimeout = 30 * time.Second
+	// mqttWriteTimeout bounds every socket write and paho's hand-off of a
+	// publish. Without it a broker that stops reading (but keeps the TCP
+	// connection) wedges paho's writer, its keepalive pings included.
+	mqttWriteTimeout = 5 * time.Second
+	// publishRetryDelay spaces out the resends of a failed publish.
+	publishRetryDelay = time.Second
+	// maxQueuedOneShots caps the events held while the broker is away.
+	maxQueuedOneShots = 100
+)
 
 // powerOffGrace is how long after PowerState=Off the hob gets to report the
 // end state of every zone itself (it does so within about 0.3 s: levels to
@@ -39,9 +53,26 @@ type zoneObs struct {
 	power string // power label: off, 1, 1.5, ..., Boost1
 }
 
+// outMsg is one queued publish. A state message names a retained state topic
+// by suffix and goes out with whatever lastPub holds for it at send time, so
+// a queued topic always carries its newest value. A one-shot message (events,
+// deleting removed topics) carries its own topic and payload.
+type outMsg struct {
+	suffix   string // state topic suffix; empty for a one-shot
+	topic    string
+	payload  string
+	retained bool
+}
+
 // Bridge turns resolved appliance values into MQTT publishes and owns the
-// MQTT connection. Values arrive in wire order from one goroutine (the
-// client's event dispatcher); the MQTT callbacks run on paho's goroutines.
+// MQTT connection. Appliance values arrive in wire order from the client's
+// event dispatcher; link and availability changes come from the controller's
+// goroutines and timers; the MQTT callbacks run on paho's goroutines.
+//
+// All of them only change the desired state (lastPub) and queue the topic.
+// One goroutine, the sender, hands the queue to paho, always with the
+// newest value. So a value can never overtake a newer one on its way to the
+// broker, and nobody but the sender ever waits on MQTT.
 type Bridge struct {
 	cfg *Config
 	log *Logger
@@ -49,14 +80,32 @@ type Bridge struct {
 	out io.Writer // dry-run sink when cli is nil (local-watch, tests)
 
 	mu sync.Mutex
-	// lastPub is the desired retained state: topic suffix -> payload. It is
-	// republished in full on every broker (re)connect, so state published
-	// while the broker was away or lost by a broker restart is restored.
+	// lastPub is the desired retained state: topic suffix -> payload. Every
+	// change queues the suffix; on every broker (re)connect all of it is
+	// queued again, so state published while the broker was away or lost by
+	// a broker restart is restored.
 	lastPub map[string]string
-	// failed marks suffixes whose last publish did not complete, so the
-	// next identical publish is not swallowed by the dedup.
-	failed        map[string]bool
-	lastAt        map[string]time.Time // when each suffix was last published (throttling)
+	// The send queue, in order. A state suffix is in it at most once: a
+	// queued suffix that changes again keeps its place.
+	queue     []outMsg
+	queued    map[string]bool      // state suffixes in queue
+	force     map[string]bool      // queued suffixes to send even if unchanged (reconnect)
+	oneShots  int                  // one-shot messages in queue
+	sentVal   map[string]string    // last payload handed to MQTT per suffix
+	lastAt    map[string]time.Time // when each suffix was last handed to MQTT (throttling)
+	retryAt   map[string]time.Time // a failed publish is resent from then on
+	inFlight  int                  // messages taken off the queue, not yet handed to MQTT
+	closing   bool
+	dryTimer  *time.Timer              // dry run: drains again when a held-back value may go
+	throttle  map[string]time.Duration // throttledSuffixes; a field so tests can shrink it
+	retryWait time.Duration            // publishRetryDelay; a field so tests can shrink it
+
+	kickCh   chan struct{} // wakes the sender
+	stopCh   chan struct{} // closed by Disconnect
+	loopDone chan struct{} // closed when the sender has stopped
+	loopOnce sync.Once     // the sender starts with the first kick
+	dryMu    sync.Mutex    // dry run: one drain at a time, so lines stay in order
+
 	deadlines     map[string]time.Time // last published timer deadline per suffix
 	unmapped      map[string]bool      // unmapped keys already logged
 	zones         map[string]*zoneObs  // by zone name (FrontLeft, ...)
@@ -78,8 +127,16 @@ func NewBridge(cfg *Config, meta deviceMeta, log *Logger) *Bridge {
 		log:       log,
 		out:       os.Stdout,
 		lastPub:   map[string]string{},
-		failed:    map[string]bool{},
+		queued:    map[string]bool{},
+		force:     map[string]bool{},
+		sentVal:   map[string]string{},
 		lastAt:    map[string]time.Time{},
+		retryAt:   map[string]time.Time{},
+		throttle:  maps.Clone(throttledSuffixes),
+		retryWait: publishRetryDelay,
+		kickCh:    make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+		loopDone:  make(chan struct{}),
 		deadlines: map[string]time.Time{},
 		unmapped:  map[string]bool{},
 		zones:     map[string]*zoneObs{},
@@ -116,6 +173,7 @@ func (b *Bridge) clientOptions() (*mqtt.ClientOptions, error) {
 		SetCleanSession(false).
 		SetKeepAlive(30*time.Second).
 		SetPingTimeout(10*time.Second).
+		SetWriteTimeout(mqttWriteTimeout).
 		SetWill(b.cfg.StateTopic("connected"), "offline", 1, true).
 		SetOnConnectHandler(b.onConnect).
 		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
@@ -148,6 +206,14 @@ func (b *Bridge) Connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Until the session with the hob is up, its data is not current. The
+	// broker may still hold the previous run's retained link=online, and HA
+	// would trust it the moment connected=online arrives, so link=offline is
+	// the first thing onConnect sends. Queued only: there is no client yet.
+	b.mu.Lock()
+	b.publishLocked("link", "offline")
+	b.mu.Unlock()
+
 	b.cli = mqtt.NewClient(opts)
 	tok := b.cli.Connect()
 	if !tok.WaitTimeout(15 * time.Second) {
@@ -165,31 +231,36 @@ func (b *Bridge) Connect(ctx context.Context) error {
 
 func (b *Bridge) onConnect(_ mqtt.Client) {
 	b.log.Info("MQTT connected to %s:%d", b.cfg.MQTT.Host, b.cfg.MQTT.Port)
-	// First, and not through publish(): its dedup sees "online" from the last
-	// connect and would swallow it, leaving it to the republish loop at the
-	// end. HA keeps the entities unavailable (the broker may have fired the
-	// last will) until this arrives, so it must not wait behind discovery.
+	// First, ahead of everything queued and of discovery: the hob link, then
+	// online. HA keeps the entities unavailable (the broker may have fired
+	// the last will) until online arrives, so it must not wait behind
+	// discovery; and the link must be there before it, or HA trusts a stale
+	// retained link for a moment.
 	b.mu.Lock()
+	if b.closing {
+		b.mu.Unlock()
+		return
+	}
 	b.lastPub["connected"] = "online"
-	delete(b.failed, "connected")
+	b.requeueFrontLocked("link", "connected")
 	b.mu.Unlock()
-	b.send(b.cfg.StateTopic("connected"), "online", true, b.onFail("connected", "online"))
+	b.kick()
+	b.waitHandedOver(mqttWriteTimeout, "link", "connected")
 
 	b.publishDiscovery()
 	b.clearRemoved()
 
-	// Republish the whole desired state: anything published while the
-	// broker was unreachable, or lost by a broker restart without
-	// persistence, is restored here.
+	// Then the whole desired state, sent even where unchanged: anything lost
+	// by a broker restart is restored. This comes after discovery on purpose:
+	// paho resends the publishes that were in flight when the connection
+	// dropped, concurrently with this callback, and those may be older. Going
+	// last, the current values win.
 	b.mu.Lock()
-	state := make(map[string]string, len(b.lastPub))
-	for k, v := range b.lastPub {
-		state[k] = v
+	if !b.closing {
+		b.requeueAllLocked()
 	}
 	b.mu.Unlock()
-	for suffix, payload := range state {
-		b.send(b.cfg.StateTopic(suffix), payload, true, b.onFail(suffix, payload))
-	}
+	b.kick()
 }
 
 func (b *Bridge) publishDiscovery() {
@@ -205,15 +276,38 @@ func (b *Bridge) publishDiscovery() {
 // and from the broker. Idempotent, so it simply runs on every connect.
 func (b *Bridge) clearRemoved() {
 	for _, d := range removedDiscovery {
-		b.send(discoveryTopic(b.cfg, d.component, d.objectID), "", true, nil)
+		b.sendOnce(discoveryTopic(b.cfg, d.component, d.objectID), "", true)
 	}
 	for _, s := range removedStateTopics {
-		b.send(b.cfg.StateTopic(s), "", true, nil)
+		b.sendOnce(b.cfg.StateTopic(s), "", true)
 	}
 }
 
+// Disconnect lets the queue drain briefly, stops the sender, then announces
+// offline and closes the connection. Bounded: a broker that stopped reading
+// costs at most a few seconds of the service manager's stop timeout.
 func (b *Bridge) Disconnect() {
-	if b.cli != nil && b.cli.IsConnected() {
+	if b.cli == nil {
+		return
+	}
+	b.mu.Lock()
+	if b.closing {
+		b.mu.Unlock()
+		return
+	}
+	b.closing = true // no more reconnect republishing
+	b.mu.Unlock()
+	if b.cli.IsConnectionOpen() {
+		b.settle(time.Second)
+	}
+	close(b.stopCh)
+	b.loopOnce.Do(func() { close(b.loopDone) }) // the sender never started
+	select {
+	case <-b.loopDone:
+	case <-time.After(time.Second):
+		b.log.Warn("MQTT sender did not stop; announcing offline anyway")
+	}
+	if b.cli.IsConnected() {
 		tok := b.cli.Publish(b.cfg.StateTopic("connected"), 1, true, "offline")
 		tok.WaitTimeout(2 * time.Second)
 		b.cli.Disconnect(500)
@@ -221,78 +315,311 @@ func (b *Bridge) Disconnect() {
 }
 
 // publish sets a retained state topic, skipping unchanged values. Reports
-// whether it published.
+// whether the desired state changed (the sender then delivers it).
 func (b *Bridge) publish(suffix, payload string) bool {
+	b.mu.Lock()
+	changed := b.publishLocked(suffix, payload)
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
+	return changed
+}
+
+// publishLocked is publish for callers that hold b.mu and need several
+// changes to be atomic. It only queues: the caller kicks the sender after
+// unlocking.
+func (b *Bridge) publishLocked(suffix, payload string) bool {
 	if payload == "" {
 		payload = noValue // never an empty retained payload: see noValue
 	}
-	b.mu.Lock()
-	if prev, ok := b.lastPub[suffix]; ok && prev == payload && !b.failed[suffix] {
-		b.mu.Unlock()
+	if prev, ok := b.lastPub[suffix]; ok && prev == payload {
 		return false
 	}
 	b.lastPub[suffix] = payload
-	b.lastAt[suffix] = time.Now()
-	delete(b.failed, suffix)
-	b.mu.Unlock()
-	b.send(b.cfg.StateTopic(suffix), payload, true, b.onFail(suffix, payload))
+	b.enqueueLocked(suffix)
 	return true
 }
 
-// publishThrottled is publish with the rate limit of throttledSuffixes.
-func (b *Bridge) publishThrottled(suffix, payload string) bool {
-	if gap, ok := throttledSuffixes[suffix]; ok {
-		b.mu.Lock()
-		prev, had := b.lastPub[suffix]
-		last := b.lastAt[suffix]
-		b.mu.Unlock()
-		zeroEdge := prev == "0" || payload == "0" || prev == "" || payload == ""
-		if had && prev != payload && !zeroEdge && time.Since(last) < gap {
-			return false
-		}
-	}
-	return b.publish(suffix, payload)
-}
-
-func (b *Bridge) onFail(suffix, payload string) func() {
-	return func() {
-		b.mu.Lock()
-		if b.lastPub[suffix] == payload {
-			b.failed[suffix] = true
-		}
-		b.mu.Unlock()
+func (b *Bridge) enqueueLocked(suffix string) {
+	if !b.queued[suffix] {
+		b.queued[suffix] = true
+		b.queue = append(b.queue, outMsg{suffix: suffix})
 	}
 }
 
-// send publishes without dedup (one-shot events, discovery cleanup, the
-// reconnect republish). onFail, if set, runs when the publish fails or
-// times out. With no MQTT client it prints to b.out instead (dry run).
-func (b *Bridge) send(topic, payload string, retained bool, onFail func()) {
+// requeueFrontLocked moves the given state suffixes (those with a value) to
+// the head of the queue, in that order, to be sent even if unchanged.
+func (b *Bridge) requeueFrontLocked(suffixes ...string) {
+	front := make([]outMsg, 0, len(suffixes)+len(b.queue))
+	first := map[string]bool{}
+	for _, s := range suffixes {
+		if _, ok := b.lastPub[s]; ok {
+			front = append(front, outMsg{suffix: s})
+			first[s] = true
+			b.queued[s], b.force[s] = true, true
+			delete(b.retryAt, s)
+		}
+	}
+	for _, m := range b.queue {
+		if m.suffix == "" || !first[m.suffix] {
+			front = append(front, m)
+		}
+	}
+	b.queue = front
+}
+
+// requeueAllLocked queues the whole desired state, to be sent even where
+// the broker should already have it.
+func (b *Bridge) requeueAllLocked() {
+	keys := make([]string, 0, len(b.lastPub))
+	for s := range b.lastPub {
+		keys = append(keys, s)
+	}
+	sort.Strings(keys)
+	for _, s := range keys {
+		b.enqueueLocked(s)
+		b.force[s] = true
+		delete(b.retryAt, s)
+	}
+}
+
+// sendOnce queues a one-shot publish: no dedup, payload fixed.
+func (b *Bridge) sendOnce(topic, payload string, retained bool) {
+	b.mu.Lock()
+	if b.oneShots >= maxQueuedOneShots {
+		b.mu.Unlock()
+		b.log.Warn("MQTT queue full; dropping %s = %s", topic, payload)
+		return
+	}
+	b.oneShots++
+	b.queue = append(b.queue, outMsg{topic: topic, payload: payload, retained: retained})
+	b.mu.Unlock()
+	b.kick()
+}
+
+// nextLocked takes the first queued message that may go out at now. wake is
+// when the earliest message held back so far may go (zero: none).
+//
+// A state topic goes out with its current desired value, unless that is
+// what was last sent (it changed and changed back) or it is held back: a
+// failed publish waits retryWait, and a throttled topic waits out its gap
+// unless the value moves to or from zero or "no value".
+func (b *Bridge) nextLocked(now time.Time) (m outMsg, ok bool, wake time.Time) {
+	hold := func(t time.Time) {
+		if wake.IsZero() || t.Before(wake) {
+			wake = t
+		}
+	}
+	for i := 0; i < len(b.queue); {
+		m := b.queue[i]
+		if m.suffix == "" {
+			b.queue = append(b.queue[:i], b.queue[i+1:]...)
+			b.oneShots--
+			return m, true, wake
+		}
+		s := m.suffix
+		payload := b.lastPub[s]
+		prev, had := b.sentVal[s]
+		forced := b.force[s]
+		if !forced && had && prev == payload {
+			b.queue = append(b.queue[:i], b.queue[i+1:]...)
+			delete(b.queued, s)
+			continue
+		}
+		if at := b.retryAt[s]; now.Before(at) {
+			hold(at)
+			i++
+			continue
+		}
+		if gap, throttled := b.throttle[s]; throttled && had && !forced {
+			edge := prev == "0" || payload == "0" || prev == noValue || payload == noValue
+			if until := b.lastAt[s].Add(gap); !edge && now.Before(until) {
+				hold(until)
+				i++
+				continue
+			}
+		}
+		b.queue = append(b.queue[:i], b.queue[i+1:]...)
+		delete(b.queued, s)
+		delete(b.force, s)
+		delete(b.retryAt, s)
+		b.sentVal[s], b.lastAt[s] = payload, now
+		return outMsg{suffix: s, topic: b.cfg.StateTopic(s), payload: payload, retained: true}, true, wake
+	}
+	return outMsg{}, false, wake
+}
+
+// kick wakes the sender. Never call it with b.mu held: in a dry run it
+// drains the queue inline.
+func (b *Bridge) kick() {
 	if b.cli == nil {
+		b.drainDry()
+		return
+	}
+	b.loopOnce.Do(func() { go b.sendLoop() })
+	select {
+	case b.kickCh <- struct{}{}:
+	default:
+	}
+}
+
+// sendLoop is the sender: the only goroutine that hands publishes to paho.
+func (b *Bridge) sendLoop() {
+	defer close(b.loopDone)
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	for {
+		wake, stopped := b.drainMQTT()
+		if stopped {
+			return
+		}
+		var timerC <-chan time.Time
+		if !wake.IsZero() {
+			timer.Reset(time.Until(wake))
+			timerC = timer.C
+		}
+		select {
+		case <-b.stopCh:
+			return
+		case <-b.kickCh:
+		case <-timerC:
+		}
+		timer.Stop()
+	}
+}
+
+// drainMQTT sends what may go out now, while the connection is open. While
+// it is not, the queue simply waits: onConnect requeues everything and kicks.
+func (b *Bridge) drainMQTT() (wake time.Time, stopped bool) {
+	for {
+		select {
+		case <-b.stopCh:
+			return time.Time{}, true
+		default:
+		}
+		if !b.cli.IsConnectionOpen() {
+			return time.Time{}, false
+		}
+		b.mu.Lock()
+		m, ok, w := b.nextLocked(time.Now())
+		if ok {
+			b.inFlight++
+		}
+		b.mu.Unlock()
+		if !ok {
+			return w, false
+		}
+		b.publishNow(m)
+		b.mu.Lock()
+		b.inFlight--
+		b.mu.Unlock()
+	}
+}
+
+// publishNow hands one message to paho (blocking at most mqttWriteTimeout)
+// and watches for its ack in the background. A state value that fails is
+// queued again, unless it has been superseded meanwhile.
+func (b *Bridge) publishNow(m outMsg) {
+	tok := b.cli.Publish(m.topic, 1, m.retained, m.payload)
+	go func() {
+		var err error
+		if !tok.WaitTimeout(publishTimeout) {
+			err = fmt.Errorf("no ack within %s", publishTimeout)
+		} else {
+			err = tok.Error()
+		}
+		if err == nil {
+			return
+		}
+		b.log.Warn("publish %s: %v", m.topic, err)
+		if m.suffix != "" {
+			b.retry(m.suffix, m.payload)
+		}
+	}()
+}
+
+func (b *Bridge) retry(suffix, payload string) {
+	b.mu.Lock()
+	if b.sentVal[suffix] == payload {
+		delete(b.sentVal, suffix)
+	}
+	again := b.lastPub[suffix] == payload && !b.closing
+	if again {
+		b.retryAt[suffix] = time.Now().Add(b.retryWait)
+		b.enqueueLocked(suffix)
+	}
+	b.mu.Unlock()
+	if again {
+		b.kick()
+	}
+}
+
+// drainDry is the sender of a dry run (no MQTT client: local-watch, tests):
+// it prints what would be published, inline and in order. A value held back
+// by the throttle is printed when it may go.
+func (b *Bridge) drainDry() {
+	b.dryMu.Lock()
+	defer b.dryMu.Unlock()
+	for {
+		b.mu.Lock()
+		now := time.Now()
+		m, ok, wake := b.nextLocked(now)
+		if !ok {
+			if !wake.IsZero() {
+				if b.dryTimer == nil {
+					b.dryTimer = time.AfterFunc(wake.Sub(now), b.drainDry)
+				} else {
+					b.dryTimer.Reset(wake.Sub(now))
+				}
+			}
+			b.mu.Unlock()
+			return
+		}
+		b.mu.Unlock()
 		retainedTag := ""
-		if retained {
+		if m.retained {
 			retainedTag = " [retained]"
 		}
 		fmt.Fprintf(b.out, "[%s] [PUB]    %-50s = %s%s\n",
-			time.Now().Format("15:04:05.000"), topic, payload, retainedTag)
-		return
+			now.Format("15:04:05.000"), m.topic, m.payload, retainedTag)
 	}
-	tok := b.cli.Publish(topic, 1, retained, payload)
-	go func() {
-		if !tok.WaitTimeout(publishTimeout) {
-			b.log.Warn("publish %s: no ack within %s", topic, publishTimeout)
-			if onFail != nil {
-				onFail()
-			}
+}
+
+// waitHandedOver waits until none of the suffixes is queued or in flight,
+// up to d.
+func (b *Bridge) waitHandedOver(d time.Duration, suffixes ...string) {
+	deadline := time.Now().Add(d)
+	for {
+		b.mu.Lock()
+		done := b.inFlight == 0
+		for _, s := range suffixes {
+			done = done && !b.queued[s]
+		}
+		b.mu.Unlock()
+		if done || time.Now().After(deadline) {
 			return
 		}
-		if err := tok.Error(); err != nil {
-			b.log.Warn("publish %s: %v", topic, err)
-			if onFail != nil {
-				onFail()
-			}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// settle waits until nothing is queued or in flight, up to d. Reports
+// whether the queue drained.
+func (b *Bridge) settle(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		b.mu.Lock()
+		idle := len(b.queue) == 0 && b.inFlight == 0
+		b.mu.Unlock()
+		if idle {
+			return true
 		}
-	}()
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // ApplyValues publishes a batch of values pushed by the hob. snapshot marks
@@ -347,7 +674,7 @@ func (b *Bridge) applyKV(key string, value interface{}, snapshot bool) {
 			return
 		}
 		state := cleanEnum(value)
-		b.send(b.cfg.StateTopic(suffix), state, false, nil)
+		b.sendOnce(b.cfg.StateTopic(suffix), state, false)
 		if strings.HasPrefix(key, "Cooking.Hob.Event.CarbonFilter") && state == "Present" {
 			b.mu.Lock()
 			b.carbonLatched = true
@@ -404,7 +731,7 @@ func (b *Bridge) applyKV(key string, value interface{}, snapshot bool) {
 		return
 	}
 	payload := formatValue(key, value)
-	b.publishThrottled(suffix, payload)
+	b.publish(suffix, payload) // throttledSuffixes are rate-limited by the sender
 
 	if key == "BSH.Common.Setting.PowerState" && payload == "Off" {
 		b.schedulePowerOffReset()
@@ -484,11 +811,19 @@ func sideOf(zone string) string {
 // are active, so a stale flag cannot outlive the joined cooking.
 func (b *Bridge) publishJoins() {
 	b.mu.Lock()
+	changed := b.publishJoinsLocked()
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
+}
+
+func (b *Bridge) publishJoinsLocked() bool {
 	left := b.joinFlag["left"] && b.zones["FrontLeft"].state == "Active" && b.zones["RearLeft"].state == "Active"
 	right := b.joinFlag["right"] && b.zones["FrontRight"].state == "Active" && b.zones["RearRight"].state == "Active"
-	b.mu.Unlock()
-	b.publish("joined_left", strconv.FormatBool(left))
-	b.publish("joined_right", strconv.FormatBool(right))
+	l := b.publishLocked("joined_left", strconv.FormatBool(left))
+	r := b.publishLocked("joined_right", strconv.FormatBool(right))
+	return l || r
 }
 
 // updateCarbon publishes the filter-replacement flag: on from carbonReplaceAt
@@ -517,22 +852,31 @@ const timerJitter = 2 * time.Second
 // wall-clock deadline and publishes it to suffix. Empty when no timer runs
 // (remaining <= 0), so HA renders "unknown" instead of a stale timestamp.
 func (b *Bridge) updateDeadline(suffix string, remainingSecs int) bool {
+	b.mu.Lock()
+	changed := b.updateDeadlineLocked(suffix, remainingSecs)
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
+	return changed
+}
+
+// updateDeadlineLocked keeps deadlines and lastPub in step: both change in
+// the same critical section.
+func (b *Bridge) updateDeadlineLocked(suffix string, remainingSecs int) bool {
 	var deadline time.Time
 	if remainingSecs > 0 {
 		deadline = time.Now().Add(time.Duration(remainingSecs) * time.Second)
 	}
-	b.mu.Lock()
 	prev := b.deadlines[suffix]
 	if !deadline.IsZero() && !prev.IsZero() {
 		d := deadline.Sub(prev)
 		if d < timerJitter && d > -timerJitter {
-			b.mu.Unlock()
 			return false
 		}
 	}
 	b.deadlines[suffix] = deadline
-	b.mu.Unlock()
-	return b.publish(suffix, formatDeadline(deadline))
+	return b.publishLocked(suffix, formatDeadline(deadline))
 }
 
 // resetOnPowerOff: once the hob is off no zone heats, no timer runs and no
@@ -566,10 +910,16 @@ func (b *Bridge) resetOnPowerOff() {
 
 // PublishLink publishes the local link's health. These topics are not gated
 // by the link itself: they must stay visible exactly when it is down.
+// The three topics change together, so they are queued together.
 func (b *Bridge) PublishLink(state hc.LinkState, since time.Time, powerCycleNeeded bool) {
-	b.publish("status/link_state", string(state))
-	b.publish("status/link_since", formatDeadline(since))
-	b.publish("status/power_cycle_needed", strconv.FormatBool(powerCycleNeeded))
+	b.mu.Lock()
+	changed := b.publishLocked("status/link_state", string(state))
+	changed = b.publishLocked("status/link_since", formatDeadline(since)) || changed
+	changed = b.publishLocked("status/power_cycle_needed", strconv.FormatBool(powerCycleNeeded)) || changed
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
 }
 
 // SetLink publishes whether the bridge has a live session with the hob.
