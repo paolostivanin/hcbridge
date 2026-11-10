@@ -1,19 +1,78 @@
 # hcbridge
 
+[![CI](https://github.com/paolostivanin/hcbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/paolostivanin/hcbridge/actions/workflows/ci.yml)
+
 A small single-binary bridge from a Bosch/Siemens/Neff (BSH) hob to MQTT,
 written in Go, speaking the appliance's **local** Home Connect protocol: no
 cloud at runtime, no API quota, no OAuth. Version 2.0.0 (`hcbridge --version`).
+
+## Contents
+
+1. [Overview](#1-overview)
+2. [How it works](#2-how-it-works)
+3. [Home Assistant entities](#3-home-assistant-entities)
+4. [Known issue: the hob refuses local connections (HTTP 503)](#4-known-issue-the-hob-refuses-local-connections-http-503)
+5. [Installation](#5-installation)
+   - [5.1 Network](#51-network)
+   - [5.2 Profile](#52-profile)
+   - [5.3 Build](#53-build)
+   - [5.4 Install](#54-install)
+   - [5.5 Configure and check](#55-configure-and-check)
+   - [5.6 Try it without MQTT](#56-try-it-without-mqtt)
+   - [5.7 Start](#57-start)
+6. [Configuration](#6-configuration)
+7. [Upgrading from 1.x](#7-upgrading-from-1x)
+8. [Operation](#8-operation)
+   - [8.1 Modes](#81-modes)
+   - [8.2 Resilience](#82-resilience)
+9. [Home Assistant automations](#9-home-assistant-automations)
+10. [MQTT topics](#10-mqtt-topics)
+11. [Development](#11-development)
+    - [11.1 Project layout](#111-project-layout)
+    - [11.2 Testing](#112-testing)
+    - [11.3 CI](#113-ci)
+12. [Security notes](#12-security-notes)
+13. [Credits](#13-credits)
+
+## 1. Overview
 
 Built for a Bosch induction cooktop with integrated ventilation (PXX801D67E).
 The bridge is **read-only** towards the appliance: it only reads what the hob
 pushes and never writes to it, and there are no MQTT command topics.
 
-## What you get in Home Assistant (via MQTT discovery)
+Status: it runs around the clock on a PXX801D67E (appliance software 1.332,
+network module 2.17.1.13549). Other BSH hobs that use the same local protocol
+should work but are untested; only profiles with `connectionType: AES` (port
+80) are supported, not TLS ones (port 443).
 
-Every entity pins its entity ID with `default_entity_id`, so the IDs survive a
-re-registration. Appliance data entities use two availability topics (the
-bridge's last will and the local link): they show `unavailable`, not frozen
-values, while the bridge cannot see the hob.
+What you need:
+- a hob with an AES profile, reachable by TCP on port 80 from the bridge
+- a Home Connect account, once, to download the hob's profile (see
+  [5.2](#52-profile))
+- an MQTT broker, and Home Assistant with the MQTT integration
+- a Linux host to run the single static binary (Alpine/OpenRC and
+  Debian/systemd are covered)
+
+## 2. How it works
+
+BSH appliances run a WebSocket server on the LAN (`ws://<hob>/homeconnect`,
+the same one the official app uses when it is on the same network). Frames
+are AES-256-CBC with a chained HMAC-SHA256, keyed per appliance; the key and
+the description of the hob's features (which numeric UID means what) come
+from a one-time download from the Home Connect account (see
+[5.2](#52-profile)). After that the bridge needs nothing from the cloud.
+
+The bridge keeps **one** session open around the clock. The hob pushes every
+change within milliseconds: each zone's level, state and timer, the fan, the
+program state. A full snapshot is read on every connect and every 6 hours.
+
+## 3. Home Assistant entities
+
+Published via MQTT discovery. Every entity pins its entity ID with
+`default_entity_id`, so the IDs survive a re-registration. Appliance data
+entities use two availability topics (the bridge's last will and the local
+link): they show `unavailable`, not frozen values, while the bridge cannot see
+the hob.
 
 Appliance data:
 - `sensor.cooktop_operation_state` - Inactive / Ready / Run / Pause / Finished / ...
@@ -41,8 +100,9 @@ Diagnostics:
 - `binary_sensor.cooktop_local_control` - someone is touching the panel
 - `sensor.cooktop_wifi_signal` (dBm) - the hob's own Wi-Fi signal
 - `sensor.cooktop_local_link` - `connecting`, `connected`, `refused` (the hob
-  answers HTTP 503, see below), `unreachable` (no TCP connection), `key_error`
-  (the profile key no longer matches), `error`
+  answers HTTP 503, see [chapter 4](#4-known-issue-the-hob-refuses-local-connections-http-503)),
+  `unreachable` (no TCP connection), `key_error` (the profile key no longer
+  matches), `error`
 - `sensor.cooktop_local_link_since` - when the current link state began
 - `binary_sensor.cooktop_power_cycle_needed` - on after the hob has refused
   local connections for 30 minutes; off again once a session connects
@@ -64,20 +124,7 @@ joined", remote start allowed).
 Not available over the local protocol either: the energy the hob shows on its
 display (the profile only has the setting that turns that display on or off).
 
-## How it works
-
-BSH appliances run a WebSocket server on the LAN (`ws://<hob>/homeconnect`,
-the same one the official app uses when it is on the same network). Frames
-are AES-256-CBC with a chained HMAC-SHA256, keyed per appliance; the key and
-the description of the hob's features (which numeric UID means what) come
-from a one-time download from the Home Connect account (see Setup). After
-that the bridge needs nothing from the cloud.
-
-The bridge keeps **one** session open around the clock. The hob pushes every
-change within milliseconds: each zone's level, state and timer, the fan, the
-program state. A full snapshot is read on every connect and every 6 hours.
-
-## Known issue: the hob refuses local connections (HTTP 503)
+## 4. Known issue: the hob refuses local connections (HTTP 503)
 
 Hobs and hoods with the older Home Connect network module (firmware
 2.17.1.13549 in every report so far) sometimes start answering every local
@@ -100,97 +147,141 @@ connection:
 
 When the hob refuses anyway, `sensor.cooktop_local_link` turns `refused` and,
 after `link.power_cycle_after` (30 min), `binary_sensor.cooktop_power_cycle_needed`
-turns on (see the automation below). It clears when a session connects again.
+turns on (see the automation in [chapter 9](#9-home-assistant-automations)).
+It clears when a session connects again.
 
 Do not run another local client (hcpy, the Home Connect Local integration)
 against the same hob, and do not probe its port 80 with nc or curl.
 
-## Setup
+## 5. Installation
 
-1. **Network.** Give the hob a DHCP reservation. The bridge dials that IP on
-   TCP port 80; it does not use mDNS, so the hob may be on another VLAN as long
-   as the bridge's TCP connection and the hob's replies are allowed.
+### 5.1 Network
 
-2. **Profile (one-time, needs the Home Connect account).** Run
-   [homeconnect-profile-downloader](https://github.com/bruestel/homeconnect-profile-downloader)
-   on a desktop, log in, and download the profile for the hob (target "Home
-   Connect Local" or "homeconnect_direct"). It writes a ZIP with
-   `<haId>.json` and the two XML files. Only `connectionType: AES` profiles
-   (port 80) are supported; the bridge rejects TLS ones. Download it again
-   after re-pairing the hob or resetting its Wi-Fi (the key changes; the bridge
-   reports `key_error`), and after a firmware update if new keys show up as
-   unmapped in the log.
+Give the hob a DHCP reservation. The bridge dials that IP on TCP port 80; it
+does not use mDNS, so the hob may be on another VLAN as long as the bridge's
+TCP connection and the hob's replies are allowed.
 
-3. **Build** (Go toolchain pinned in `go.mod`):
-   ```sh
-   git clone <this repo>
-   cd hcbridge
-   make release      # tests, refuses a dirty tree, prints version + sha256
-   ```
-   The binary is static (`CGO_ENABLED=0`), so a build from any distro runs on
-   Alpine (musl). Deploy only release builds: `hcbridge --version` must not
-   say `-dirty`.
+### 5.2 Profile
 
-4. **Install** (LXC / Linux host). The config holds the MQTT password and the
-   profile holds the hob's key: both readable by the service, owned by root.
+One-time, needs the Home Connect account. Run
+[homeconnect-profile-downloader](https://github.com/bruestel/homeconnect-profile-downloader)
+on a desktop, log in, and download the profile for the hob (target "Home
+Connect Local" or "homeconnect_direct"). It writes a ZIP with `<haId>.json`
+and the two XML files. Only `connectionType: AES` profiles (port 80) are
+supported; the bridge rejects TLS ones. Download it again after re-pairing the
+hob or resetting its Wi-Fi (the key changes; the bridge reports `key_error`),
+and after a firmware update if new keys show up as unmapped in the log.
 
-   On **Alpine** (OpenRC):
-   ```sh
-   addgroup -S hcbridge
-   adduser -S -D -H -s /sbin/nologin -G hcbridge hcbridge
-   install -d -m 0755 /opt/hcbridge /etc/hcbridge
-   install -d -m 0750 -o root -g hcbridge /etc/hcbridge/profile
-   install -d -m 0700 -o hcbridge -g hcbridge /var/lib/hcbridge /var/log/hcbridge
-   install -m 0755 hcbridge /opt/hcbridge/
-   install -m 0640 -o root -g hcbridge config.example.yaml /etc/hcbridge/config.yaml
-   install -m 0640 -o root -g hcbridge <profile>.zip /etc/hcbridge/profile/
-   install -m 0755 openrc/hcbridge /etc/init.d/hcbridge
-   ```
-   `logfile: /var/log/hcbridge/hcbridge.log` in the config (there is no
-   journald); stdout/stderr land in `/var/log/hcbridge/std{out,err}.log`.
+### 5.3 Build
 
-   On **Debian** (systemd):
-   ```sh
-   sudo useradd --system --no-create-home --shell /usr/sbin/nologin hcbridge
-   sudo install -d -m 0755 /opt/hcbridge /etc/hcbridge
-   sudo install -d -m 0750 -o root -g hcbridge /etc/hcbridge/profile
-   sudo install -m 0755 hcbridge /opt/hcbridge/
-   sudo install -m 0640 -o root -g hcbridge config.example.yaml /etc/hcbridge/config.yaml
-   sudo install -m 0640 -o root -g hcbridge <profile>.zip /etc/hcbridge/profile/
-   sudo install -m 0644 hcbridge.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   ```
-   The unit creates `/var/lib/hcbridge` and `/var/log/hcbridge` itself.
+Go toolchain pinned in `go.mod`:
 
-5. **Configure**: edit `/etc/hcbridge/config.yaml` - at minimum
-   `appliance.host`, `appliance.profile` and `mqtt.host` - then check it. This
-   reads the profile and lists what the hob can report, without touching the
-   network:
-   ```sh
-   su -s /bin/sh hcbridge -c '/opt/hcbridge/hcbridge --mode=check-config --config=/etc/hcbridge/config.yaml'
-   ```
-   Unknown keys are errors.
+```sh
+git clone https://github.com/paolostivanin/hcbridge
+cd hcbridge
+make release      # tests, refuses a dirty tree, prints version + sha256
+```
 
-6. **Try it** without MQTT (as the service user, with the service stopped):
-   ```sh
-   su -s /bin/sh hcbridge -c '/opt/hcbridge/hcbridge --mode=local-watch --config=/etc/hcbridge/config.yaml'
-   ```
-   Switch the hob on and touch a zone: every value prints as it arrives, with
-   the `[PUB]` lines run mode would publish. Stop it with Ctrl-C (it closes the
-   session cleanly). The first run creates the device ID in the state directory.
+The binary is static (`CGO_ENABLED=0`), so a build from any distro runs on
+Alpine (musl). Deploy only release builds: `hcbridge --version` must not say
+`-dirty`. A plain `make build` (or `go build ./src`) builds the same binary
+without the checks.
 
-7. **Start**: `rc-update add hcbridge default && rc-service hcbridge start`
-   (Alpine) or `systemctl enable --now hcbridge` (Debian). The log's first line
-   is the version, then "connected to ... appliance <version>, network module
-   <version>".
+### 5.4 Install
 
-## Upgrading from 1.x (cloud) on Alpine
+On a Linux host or LXC. The config holds the MQTT password and the profile
+holds the hob's key: both readable by the service, owned by root.
 
-2.0.0 does not read the 1.x config (the `oauth` block is gone).
+On **Alpine** (OpenRC):
+```sh
+addgroup -S hcbridge
+adduser -S -D -H -s /sbin/nologin -G hcbridge hcbridge
+install -d -m 0755 /opt/hcbridge /etc/hcbridge
+install -d -m 0750 -o root -g hcbridge /etc/hcbridge/profile
+install -d -m 0700 -o hcbridge -g hcbridge /var/lib/hcbridge /var/log/hcbridge
+install -m 0755 hcbridge /opt/hcbridge/
+install -m 0640 -o root -g hcbridge config.example.yaml /etc/hcbridge/config.yaml
+install -m 0640 -o root -g hcbridge <profile>.zip /etc/hcbridge/profile/
+install -m 0755 openrc/hcbridge /etc/init.d/hcbridge
+```
+`logfile: /var/log/hcbridge/hcbridge.log` in the config (there is no
+journald); stdout/stderr land in `/var/log/hcbridge/std{out,err}.log`.
+
+On **Debian** (systemd):
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin hcbridge
+sudo install -d -m 0755 /opt/hcbridge /etc/hcbridge
+sudo install -d -m 0750 -o root -g hcbridge /etc/hcbridge/profile
+sudo install -m 0755 hcbridge /opt/hcbridge/
+sudo install -m 0640 -o root -g hcbridge config.example.yaml /etc/hcbridge/config.yaml
+sudo install -m 0640 -o root -g hcbridge <profile>.zip /etc/hcbridge/profile/
+sudo install -m 0644 hcbridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+The unit creates `/var/lib/hcbridge` and `/var/log/hcbridge` itself.
+
+### 5.5 Configure and check
+
+Edit `/etc/hcbridge/config.yaml` - at minimum `appliance.host`,
+`appliance.profile` and `mqtt.host` (all keys are in
+[chapter 6](#6-configuration)) - then check it. This reads the profile and
+lists what the hob can report, without touching the network:
+
+```sh
+su -s /bin/sh hcbridge -c '/opt/hcbridge/hcbridge --mode=check-config --config=/etc/hcbridge/config.yaml'
+```
+
+Unknown keys are errors.
+
+### 5.6 Try it without MQTT
+
+As the service user, with the service stopped:
+
+```sh
+su -s /bin/sh hcbridge -c '/opt/hcbridge/hcbridge --mode=local-watch --config=/etc/hcbridge/config.yaml'
+```
+
+Switch the hob on and touch a zone: every value prints as it arrives, with
+the `[PUB]` lines run mode would publish. Stop it with Ctrl-C (it closes the
+session cleanly). The first run creates the device ID in the state directory.
+
+### 5.7 Start
+
+`rc-update add hcbridge default && rc-service hcbridge start` (Alpine) or
+`systemctl enable --now hcbridge` (Debian). The log's first line is the
+version, then "connected to ... appliance <version>, network module
+<version>".
+
+## 6. Configuration
+
+`config.example.yaml` documents every key. Unknown keys are errors.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `appliance.host` | required | the hob's IP or hostname, optional `:port` (default 80) |
+| `appliance.profile` | required | profile ZIP from the downloader, or a directory with its extracted files |
+| `appliance.ha_id` | - | must match the profile; picks one if the ZIP holds several |
+| `appliance.topic_slug` | `cooktop` | MQTT topic root `homeconnect/<slug>/...` (`[a-z0-9_-]`) |
+| `appliance.friendly_id` | `Cooktop` | the HA device's name |
+| `mqtt.host` | required for `run` | broker address |
+| `mqtt.port` | 1883 (8883 with TLS) | |
+| `mqtt.username`, `mqtt.password` | - | |
+| `mqtt.client_id` | `hcbridge-<hostname>` | must be unique per running bridge |
+| `mqtt.discovery_topic` | `homeassistant` | HA's discovery prefix |
+| `mqtt.tls`, `mqtt.ca_file` | `false`, - | TLS 1.2+ to the broker; CA for its certificate |
+| `link.power_cycle_after` | `30m` (min `1m`) | continuous HTTP 503 refusals before `power_cycle_needed` turns on |
+| `state_dir` | `/var/lib/hcbridge` | device ID, lock, link episode, device info, liveness file |
+| `logfile` | stdout | log file (rotated); empty logs to stdout |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `WARN` or `ERROR` |
+
+## 7. Upgrading from 1.x
+
+2.0.0 talks to the hob locally instead of the cloud API and does not read the
+1.x config (the `oauth` block is gone). On Alpine:
 
 1. Build with `make release` and note the sha256. Install the profile and
-   check the hob connects with `--mode=local-watch` (step 6 above; the 1.x
-   service may keep running meanwhile, it only uses the cloud).
+   check the hob connects with `--mode=local-watch` ([5.6](#56-try-it-without-mqtt);
+   the 1.x service may keep running meanwhile, it only uses the cloud).
 2. Keep the old setup for a rollback: `cp /etc/hcbridge/config.yaml /etc/hcbridge/config.yaml.1x`,
    and stop 1.x with its own init script: `rc-service hcbridge stop`.
 3. Write the new config: remove `oauth`, add `appliance.host` and
@@ -208,7 +299,9 @@ against the same hob, and do not probe its port 80 with nc or curl.
 Update anything in HA that used the removed entities
 (`binary_sensor.cooktop_cloud_connection`, `binary_sensor.cooktop_api_rate_limited`, ...).
 
-## Modes
+## 8. Operation
+
+### 8.1 Modes
 
 - `run` (default) - the service.
 - `check-config` - load and validate the config and the profile, print what
@@ -221,13 +314,13 @@ Update anything in HA that used the removed entities
   so the two cannot run at once.
 - `--version` - print version, VCS revision and toolchain.
 
-## Resilience
+### 8.2 Resilience
 
-- **Local link**: see "Known issue" above for the connection rules. A
-  corrupted frame or a missing pong ends the session with a Close frame and a
-  reconnect; a stale key shows as `key_error` after three failed connects.
-  The data entities go unavailable 30 s after the session drops (a routine
-  reconnect takes a second).
+- **Local link**: see [chapter 4](#4-known-issue-the-hob-refuses-local-connections-http-503)
+  for the connection rules. A corrupted frame or a missing pong ends the
+  session with a Close frame and a reconnect; a stale key shows as `key_error`
+  after three failed connects. The data entities go unavailable 30 s after the
+  session drops (a routine reconnect takes a second).
 - **State**: the state directory holds the device ID (never replaced on its
   own: a damaged file is an error), the lock, the last link episode
   (`link.json`: a restart keeps the power-cycle clock and waits before
@@ -245,7 +338,7 @@ Update anything in HA that used the removed entities
 - **Logs**: lumberjack rotation, 5 MB x 7 backups x 14 days, gzip. The
   profile key never appears in logs or recordings.
 
-## Home Assistant automations
+## 9. Home Assistant automations
 
 Notify when the hob needs a power cycle, and when it is back:
 
@@ -294,31 +387,14 @@ Notify when the hob needs a power cycle, and when it is back:
 Also worth an alert: `sensor.cooktop_bridge_heartbeat` older than 15 minutes,
 and `binary_sensor.cooktop_carbon_filter_replace` turning on.
 
-## Testing
+## 10. MQTT topics
 
-`make test` runs vet plus the unit tests under the race detector; `make check`
-adds staticcheck and govulncheck. The tests drive the real client and bridge
-against `internal/homeconnect/hcfake`, a fake hob that speaks the protocol and
-can refuse with 503, stop answering pings, corrupt a frame, change its key or
-drop the connection. `make e2e` runs the end-to-end test against a throwaway
-Mosquitto container:
-
-```sh
-make e2e
-```
-
-GitHub Actions (`.github/workflows/ci.yml`) runs the same on every push and
-pull request to `main`: gofmt, `go mod tidy`, vet, a static build, the race
-tests, staticcheck, govulncheck and the end-to-end test.
-
-## Verify with MQTT
+Verify with a subscription; touch the hob and the state topics update within
+a second:
 
 ```sh
 mosquitto_sub -h <broker> -t 'homeconnect/cooktop/#' -v
 ```
-Touch the hob; state topics update within a second.
-
-## Topic conventions
 
 State (retained, published by the bridge):
 - `homeconnect/cooktop/connected` - `online` | `offline` (last will)
@@ -355,7 +431,58 @@ Events (not retained; payload `Present`, `Confirmed` or `Off`):
 
 There are no command topics.
 
-## Security notes
+## 11. Development
+
+### 11.1 Project layout
+
+```
+.
+├── src/                          Go sources (package main) and their tests
+│   ├── main.go                   flags and modes
+│   ├── config.go                 YAML config and validation
+│   ├── controller.go             main loop: client events to the bridge, link monitor, heartbeat
+│   ├── link.go                   the power_cycle_needed latch
+│   ├── state.go                  device ID, lock, device.json, link.json
+│   ├── mqttbridge.go             MQTT connection, values to topics, zone and timer logic
+│   ├── mapping.go                feature names to topic suffixes, value labels
+│   ├── discovery.go              Home Assistant discovery entities
+│   ├── localwatch.go             --mode=local-watch and the profile summary
+│   ├── log.go, util.go, version.go
+│   └── internal/homeconnect/     the local protocol
+│       ├── crypto.go             AES-CBC + HMAC frame codec
+│       ├── message.go            message encoding and lenient parsing
+│       ├── profile.go            device profile: key, UID names, enums
+│       ├── session.go            handshake, requests, liveness
+│       ├── client.go             supervisor: link state, backoff, reconnects
+│       ├── errors.go
+│       └── hcfake/               fake hob for tests, with a synthetic profile
+├── openrc/hcbridge               Alpine init script
+├── hcbridge.service              systemd unit
+├── config.example.yaml
+├── Makefile                      build, test, check, e2e, release
+├── .github/workflows/ci.yml
+└── go.mod, go.sum                module at the repository root
+```
+
+`go.mod` stays at the root, so `go test ./...` and `go mod tidy` run from
+there; the binary builds from `./src`.
+
+### 11.2 Testing
+
+`make test` runs vet plus the unit tests under the race detector; `make check`
+adds staticcheck and govulncheck. The tests drive the real client and bridge
+against `src/internal/homeconnect/hcfake`, a fake hob that speaks the protocol
+and can refuse with 503, stop answering pings, corrupt a frame, change its key
+or drop the connection. `make e2e` runs the end-to-end test against a
+throwaway Mosquitto container (needs docker).
+
+### 11.3 CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull
+request to `main`: gofmt, `go mod tidy`, vet, a static build, the race tests,
+staticcheck, govulncheck, and the end-to-end test in a second job.
+
+## 12. Security notes
 
 - The profile's key gives full local control of the hob to anyone on the
   LAN who has it: keep it `0640 root:hcbridge`, never commit it (the repo's
@@ -369,7 +496,7 @@ There are no command topics.
 - The MQTT client ID defaults to `hcbridge-<hostname>`; it must be unique per
   running bridge because the session is persistent.
 
-## Credits
+## 13. Credits
 
 The local protocol was reverse-engineered by
 [hcpy](https://github.com/osresearch/hcpy) and documented further by
@@ -379,3 +506,5 @@ The local protocol was reverse-engineered by
 [Kessel](https://github.com/ediiiz/Kessel); the profile comes from
 [homeconnect-profile-downloader](https://github.com/bruestel/homeconnect-profile-downloader).
 hcbridge's implementation is its own (Go standard library crypto, gorilla/websocket).
+
+Licensed under the MIT license (see `LICENSE`).
