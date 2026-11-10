@@ -15,21 +15,29 @@ import (
 // when a session connects, so "on" means "go flip the breaker" and "off
 // again" means "it worked".
 //
-// What counts is refusal without a session in between. An "error" attempt
-// (a dropped or garbled upgrade answer, a timeout) and "connecting" say
-// nothing about whether the firmware still refuses, so they neither end nor
-// restart the episode; the flag only latches while the state is refused.
-// "unreachable" (the hob is off the network) and a key error do restart it.
+// What counts is refusal with no session accepted in between. An "error"
+// attempt that failed before the upgrade was accepted (a dropped or garbled
+// answer, a timeout) and "connecting" say nothing about whether the
+// firmware still refuses, so they neither end nor restart the episode; the
+// flag only latches while the state is refused. An attempt the appliance
+// accepted (HTTP 101) but that failed later, "unreachable" (the hob is off
+// the network) and a key error do end it.
 type linkMonitor struct {
 	threshold    time.Duration
 	state        hc.LinkState
 	since        time.Time
 	refusedSince time.Time
+	downSince    time.Time // start of the current run without a session; zero while connected
 	latched      bool
 }
 
 func (m *linkMonitor) update(st hc.LinkStatus) {
 	m.state, m.since = st.State, st.Since
+	if st.State == hc.LinkConnected {
+		m.downSince = time.Time{}
+	} else if m.downSince.IsZero() {
+		m.downSince = st.Since
+	}
 	switch st.State {
 	case hc.LinkRefused:
 		if m.refusedSince.IsZero() {
@@ -38,7 +46,11 @@ func (m *linkMonitor) update(st hc.LinkStatus) {
 	case hc.LinkConnected:
 		m.refusedSince = time.Time{}
 		m.latched = false
-	case hc.LinkError, hc.LinkConnecting:
+	case hc.LinkError:
+		if st.Upgraded {
+			m.refusedSince = time.Time{} // the appliance accepted a session: not refusing
+		}
+	case hc.LinkConnecting:
 		// Neutral: the episode carries on.
 	default:
 		m.refusedSince = time.Time{}
@@ -57,11 +69,12 @@ func (m *linkMonitor) restore(r linkRecord) {
 	m.state = hc.LinkState(r.State)
 	m.since = r.Since
 	m.refusedSince = r.RefusedSince
+	m.downSince = r.downSince()
 	m.latched = r.Latched
 }
 
 func (m *linkMonitor) record(lastDial time.Time) linkRecord {
-	return linkRecord{State: string(m.state), Since: m.since, RefusedSince: m.refusedSince, Latched: m.latched, LastDial: lastDial}
+	return linkRecord{State: string(m.state), Since: m.since, RefusedSince: m.refusedSince, DownSince: m.downSince, Latched: m.latched, LastDial: lastDial}
 }
 
 // Dial spacing carried over from link.json (see linkBook.spacing).
@@ -69,6 +82,9 @@ const (
 	resumeGapConnected = 5 * time.Second // after a run that ended connected
 	resumeGapMin       = 30 * time.Second
 	resumeGapMax       = 5 * time.Minute // the client's backoff cap
+	// A session younger than this when the record was read probably ended
+	// with the process (a crash loop): it is spaced like a failure.
+	resumeUnstable = 2 * time.Minute
 )
 
 // linkBook is the link episode the two local clients share through
@@ -94,9 +110,21 @@ func openLinkBook(dir string, threshold time.Duration, log *Logger) *linkBook {
 	rec, err := loadLinkRecord(dir)
 	if err != nil {
 		log.Warn("read link.json: %v (starting fresh)", err)
+		rec = linkRecord{}
+	}
+	now := time.Now()
+	if rec.LastDial.After(now) {
+		rec.LastDial = now // a clock that was ahead must not hold the first dial back
 	}
 	lb := &linkBook{dir: dir, log: log, mon: linkMonitor{threshold: threshold}, lastDial: rec.LastDial, loaded: rec}
 	lb.mon.restore(rec)
+	// The refusal clock only runs while a client watches: the time since
+	// the last dial (the bridge stopped, or between the service and
+	// local-watch) is not counted. A refusal seen before a long stop must
+	// not raise the flag at startup against a hob that may have recovered.
+	if !lb.mon.latched && !lb.mon.refusedSince.IsZero() && !rec.LastDial.IsZero() {
+		lb.mon.refusedSince = lb.mon.refusedSince.Add(now.Sub(rec.LastDial))
+	}
 	return lb
 }
 
@@ -133,19 +161,24 @@ func (lb *linkBook) record(st hc.LinkStatus, now time.Time) {
 
 // spacing is when the first dial may happen and the backoff to carry on
 // with, from the record loaded at start: at least resumeGapConnected after
-// the last dial, and after a failure episode as far apart as its retries
-// had grown by then (the episode's length, from resumeGapMin up to the
-// backoff cap). So neither a restart nor local-watch after the service
-// starts the backoff over at 5 s against a hob that refuses.
+// the last dial, and after failed attempts as far apart as their retries
+// had grown by then (the time without a session up to the last dial, from
+// resumeGapMin up to the backoff cap). So neither a restart nor local-watch
+// after the service (nor the service after local-watch) starts the backoff
+// over at 5 s against a hob that refuses. A session that had only just
+// connected when the record was read (a crash loop) counts as a failure.
 func (lb *linkBook) spacing() (notBefore time.Time, backoff time.Duration) {
 	r := lb.loaded
 	if r.LastDial.IsZero() {
 		return time.Time{}, 0
 	}
 	if r.State == "" || hc.LinkState(r.State) == hc.LinkConnected {
+		if time.Since(r.Since) < resumeUnstable {
+			return r.LastDial.Add(resumeGapMin), resumeGapMin
+		}
 		return r.LastDial.Add(resumeGapConnected), 0
 	}
-	gap := min(max(r.LastDial.Sub(r.Since), resumeGapMin), resumeGapMax)
+	gap := min(max(r.LastDial.Sub(r.downSince()), resumeGapMin), resumeGapMax)
 	return r.LastDial.Add(gap), gap
 }
 

@@ -145,17 +145,20 @@ connection:
 - no `Origin` header (the hob ignores upgrades that carry one)
 - a clean WebSocket Close before every deliberate disconnect and on shutdown;
   a stop during a connection attempt lets the upgrade finish (at most 15 s)
-  and closes that session cleanly too, so the service files allow 30 s to stop
+  and closes that session cleanly too, so the service files allow 40 s to stop
 - reconnects back off from 5 s to 5 min with jitter; the last dial and the
-  spacing reached survive a restart (and carry over between the service and
-  `local-watch`), so neither a crash loop nor a diagnostic run hammers the hob
+  spacing reached survive a restart and carry over between the service and
+  `local-watch` in both directions. A session that ended within 2 minutes of
+  connecting (a crash loop) is spaced like a failure: at least 30 s apart
 
 When the hob refuses anyway, `sensor.cooktop_local_link` turns `refused` and,
 after `link.power_cycle_after` (30 min), `binary_sensor.cooktop_power_cycle_needed`
 turns on (see the automation in [chapter 9](#9-home-assistant-automations)).
 It clears when a session connects again. Failed attempts of other kinds in
-between (a dropped or garbled answer, a timeout) don't restart the clock; the
-hob dropping off the network does.
+between (a dropped or garbled answer, a timeout) don't restart the clock; an
+upgrade the hob accepts, or the hob dropping off the network, does. The clock
+only runs while the bridge (or `local-watch`) is watching: time it was
+stopped does not count.
 
 Do not run another local client (hcpy, the Home Connect Local integration)
 against the same hob, and do not probe its port 80 with nc or curl.
@@ -333,19 +336,24 @@ Update anything in HA that used the removed entities
   the first session is up.
 - **State**: the state directory holds the device ID (never replaced on its
   own: a damaged file is an error), the lock, the last link episode
-  (`link.json`: a restart keeps the power-cycle clock and the dial spacing)
+  (`link.json`: a restart keeps the power-cycle clock, paused while stopped,
+  and the dial spacing)
   and the last device info (`device.json`: the firmware in HA
   before the first connect).
 - **MQTT**: auto-reconnect (backoff capped at 30 s) with a last will
   (`connected = offline`), which the bridge counters on every connect with the
   hob link and then `online`, before anything else. On a cold start the link
-  is `offline` until the session with the hob is up, so HA never shows the
-  previous run's retained values as current. The full retained state is
-  republished on every reconnect. All publishes go through one sender that
-  always sends a topic's newest value, so a republish cannot overwrite a newer
-  value, and the hob's session never waits on a slow broker (writes time out
-  after 5 s). A publish that is not acknowledged is sent again. The first
-  broker connection may take as long as it needs (no exit on a boot race).
+  is `offline` until the session with the hob is up, so HA does not show the
+  previous run's retained values as current while the bridge cannot see the
+  hob (if the hob answers the snapshot with an error, values it does not push
+  stay stale until a retry succeeds). The full retained state is republished
+  on every reconnect. Every state and event publish goes through one sender
+  that always sends a topic's newest value, so a republish cannot overwrite a
+  newer value, and the hob's session never waits on a slow broker (writes
+  time out after 5 s); only discovery and the final `offline` are sent
+  directly. A state publish that is not acknowledged is sent again (events
+  are not). The first broker connection may take as long as it needs (no exit
+  on a boot race).
   Values the hob pushes every second (elapsed time, progress) are published
   at most every 15 s; the last one is always delivered.
 - **Process**: under OpenRC `supervise-daemon` (see `openrc/hcbridge`) the

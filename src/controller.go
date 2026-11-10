@@ -40,14 +40,15 @@ type controller struct {
 	link *linkBook
 
 	// streamMu likewise covers each availability decision and its publish.
-	streamMu     sync.Mutex
-	streamUp     bool
-	streamGen    uint64 // bumped on every up and every grace started: identifies the live grace timer
-	offlineTimer *time.Timer
-	offlineGrace time.Duration // linkOfflineGrace; a field so tests can shrink it
-	evalEvery    time.Duration // linkEvalEvery, heartbeatEvery, aliveEvery: likewise
-	beatEvery    time.Duration
-	aliveEvery   time.Duration
+	streamMu      sync.Mutex
+	streamUp      bool
+	streamOffline bool   // link=offline is published: a new outage needs no grace
+	streamGen     uint64 // bumped on every up and every grace started: identifies the live grace timer
+	offlineTimer  *time.Timer
+	offlineGrace  time.Duration // linkOfflineGrace; a field so tests can shrink it
+	evalEvery     time.Duration // linkEvalEvery, heartbeatEvery, aliveEvery: likewise
+	beatEvery     time.Duration
+	aliveEvery    time.Duration
 
 	optsHook func(*hc.Options) // tests shorten the client's timings
 	now      func() time.Time
@@ -75,14 +76,18 @@ func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <
 	// and the dials stay as far apart as they had grown.
 	c.link.mu.Lock()
 	if rec := c.link.loaded; rec.State != "" {
-		c.bridge.PublishLink(hc.LinkState(rec.State), rec.Since, c.link.mon.powerCycleNeeded(c.now()))
+		pc := c.link.mon.powerCycleNeeded(c.now())
+		if pc {
+			c.log.Warn("the hob still needs a power cycle: refused local connections since %s (breaker off ~30 s)", rec.RefusedSince.Format(time.RFC3339))
+		}
+		c.bridge.PublishLink(hc.LinkState(rec.State), rec.Since, pc)
 	}
 	c.link.mu.Unlock()
 
 	// The session is not up yet, and nothing says the broker's retained
 	// values are current: the data entities are unavailable until it is.
 	c.streamMu.Lock()
-	c.streamUp = false
+	c.streamUp, c.streamOffline = false, true
 	c.bridge.SetLink(false)
 	c.streamMu.Unlock()
 
@@ -160,8 +165,12 @@ func (c *controller) handle(ev hc.Event) {
 
 func (c *controller) onLink(st hc.LinkStatus) {
 	c.link.mu.Lock()
+	was := c.link.mon.latched
 	c.link.mon.update(st)
 	pc := c.link.mon.powerCycleNeeded(c.now())
+	if pc && !was {
+		c.warnPowerCycle()
+	}
 	c.link.saveLocked() // persist before announcing
 	c.bridge.PublishLink(st.State, st.Since, pc)
 	c.link.mu.Unlock()
@@ -184,10 +193,14 @@ func (c *controller) evaluateLink() {
 	m := &c.link.mon
 	was := m.latched
 	if pc := m.powerCycleNeeded(c.now()); pc && !was {
-		c.log.Warn("the hob has refused local connections for %s; power cycle it (breaker off ~30 s)", c.cfg.Link.PowerCycleAfter)
+		c.warnPowerCycle()
 		c.link.saveLocked() // persist before announcing
 		c.bridge.PublishLink(m.state, m.since, pc)
 	}
+}
+
+func (c *controller) warnPowerCycle() {
+	c.log.Warn("the hob has refused local connections for %s; power cycle it (breaker off ~30 s)", c.cfg.Link.PowerCycleAfter)
 }
 
 func (c *controller) onInfo(info *hc.DeviceInfo) {
@@ -226,7 +239,7 @@ func (c *controller) touchAlive() {
 func (c *controller) streamUpNow() {
 	c.streamMu.Lock()
 	defer c.streamMu.Unlock()
-	c.streamUp = true
+	c.streamUp, c.streamOffline = true, false
 	c.streamGen++ // a grace callback already running finds itself superseded
 	if c.offlineTimer != nil {
 		c.offlineTimer.Stop()
@@ -236,12 +249,13 @@ func (c *controller) streamUpNow() {
 }
 
 // streamDown starts the grace period after which the data entities are
-// marked unavailable, unless the session is back by then.
+// marked unavailable, unless the session is back by then (or they already
+// are: at startup, or after an earlier grace ran out).
 func (c *controller) streamDown() {
 	c.streamMu.Lock()
 	defer c.streamMu.Unlock()
 	c.streamUp = false
-	if c.offlineTimer != nil {
+	if c.offlineTimer != nil || c.streamOffline {
 		return
 	}
 	c.streamGen++
@@ -261,7 +275,7 @@ func (c *controller) offlineExpired(gen uint64) {
 	}
 	// Still the current grace: streamUpNow bumps the generation, so the
 	// session has not come back since.
-	c.offlineTimer = nil
+	c.offlineTimer, c.streamOffline = nil, true
 	c.log.Warn("local session down for %s; marking cooktop data unavailable", c.offlineGrace)
 	c.bridge.SetLink(false)
 }

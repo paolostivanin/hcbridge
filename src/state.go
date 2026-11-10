@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 // The state directory (state_dir, /var/lib/hcbridge) holds what must
@@ -153,8 +155,18 @@ type linkRecord struct {
 	State        string    `json:"state"`
 	Since        time.Time `json:"since"`
 	RefusedSince time.Time `json:"refused_since,omitempty"`
+	DownSince    time.Time `json:"down_since,omitempty"` // added in 2.0.2; older files lack it
 	Latched      bool      `json:"power_cycle_needed,omitempty"`
 	LastDial     time.Time `json:"last_dial,omitempty"`
+}
+
+// downSince is when the run of failed attempts began; a file written before
+// the field existed falls back to the start of the current state.
+func (r linkRecord) downSince() time.Time {
+	if r.DownSince.IsZero() && r.State != "" && hc.LinkState(r.State) != hc.LinkConnected {
+		return r.Since
+	}
+	return r.DownSince
 }
 
 func loadLinkRecord(dir string) (linkRecord, error) {

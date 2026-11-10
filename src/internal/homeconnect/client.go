@@ -40,7 +40,7 @@ type Options struct {
 	StableAfter    time.Duration // a session this long resets the backoff (60 s)
 	MinDialGap     time.Duration // never dial more often than this (5 s)
 	KeyErrorAfter  int           // first-frame MAC failures in a row before key_error (3)
-	ResyncEvery    time.Duration // re-read all values on the live session (6 h; <0 disables)
+	ResyncEvery    time.Duration // re-read all values on the live session (6 h; <0 disables, retries of a failed read still run)
 	// After a failed full read (at connect or a resync) it is retried on the
 	// same session from SnapshotRetryMin, doubling up to SnapshotRetryMax.
 	SnapshotRetryMin time.Duration // 5 s
@@ -118,6 +118,10 @@ type LinkStatus struct {
 	Since    time.Time // when this state began (unchanged across retries)
 	Err      error     // last error, nil when connected
 	Attempts int       // failed attempts in this state
+	// Upgraded: the last failed attempt got past the HTTP upgrade, so the
+	// appliance accepted the session (and was not refusing) before it
+	// failed. A change of this alone is reported too.
+	Upgraded bool
 }
 
 // EventKind tells the Event fields apart.
@@ -259,7 +263,7 @@ func (c *Client) Run(ctx context.Context) {
 		if o.OnDial != nil {
 			o.OnDial(lastDial)
 		}
-		connectedAt, err := c.runSession(ctx)
+		connectedAt, upgraded, err := c.runSession(ctx)
 		if ctx.Err() != nil {
 			return
 		}
@@ -277,7 +281,7 @@ func (c *Client) Run(ctx context.Context) {
 			} else {
 				firstFrameFails = 0
 			}
-			c.setLink(classify(err, firstFrameFails, o.KeyErrorAfter), err)
+			c.setLinkAfter(classify(err, firstFrameFails, o.KeyErrorAfter), err, upgraded)
 		}
 		if !sleepCtx(ctx, applyJitter(backoff, o.jitter())) {
 			return
@@ -287,16 +291,17 @@ func (c *Client) Run(ctx context.Context) {
 }
 
 // runSession dials, handshakes and serves one connection. connectedAt is
-// zero if the handshake never completed.
-func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err error) {
+// zero if the handshake never completed; upgraded reports whether the
+// appliance accepted the WebSocket upgrade.
+func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, upgraded bool, err error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
 	s, err := newSession(c, conn)
 	if err != nil {
 		conn.Close()
-		return time.Time{}, err
+		return time.Time{}, true, err
 	}
 	go s.readLoop()
 
@@ -308,13 +313,19 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 	case init = <-s.initCh:
 	case <-s.fail:
 		s.end()
-		return time.Time{}, s.closedErr()
+		return time.Time{}, true, s.closedErr()
 	case <-time.After(c.opts.InitTimeout):
 		s.closeGracefully(1000, "")
-		return time.Time{}, &TimeoutError{Resource: "/ei/initialValues"}
+		return time.Time{}, true, &TimeoutError{Resource: "/ei/initialValues"}
 	case <-ctx.Done():
 		s.closeGracefully(1000, "")
-		return time.Time{}, ctx.Err()
+		return time.Time{}, true, ctx.Err()
+	}
+	if ctx.Err() != nil {
+		// Shut down while the upgrade was in progress: no handshake, just
+		// the Close (init and the cancellation can arrive together).
+		s.closeGracefully(1000, "")
+		return time.Time{}, true, ctx.Err()
 	}
 	setup := func(init *Message) (info *DeviceInfo, snapFailed, err error) {
 		if info, err = s.handshake(sctx, init); err != nil {
@@ -327,9 +338,9 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 	if err != nil {
 		s.end()
 		if errors.Is(err, ErrFirstFrameMAC) || errors.Is(err, ErrDesync) {
-			return time.Time{}, err
+			return time.Time{}, true, err
 		}
-		return time.Time{}, fmt.Errorf("handshake: %w", err)
+		return time.Time{}, true, fmt.Errorf("handshake: %w", err)
 	}
 	connectedAt = time.Now()
 	c.emit(Event{Kind: EvInfo, Info: info})
@@ -372,20 +383,20 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 		select {
 		case <-ctx.Done():
 			s.closeGracefully(1000, "")
-			return connectedAt, ctx.Err()
+			return connectedAt, true, ctx.Err()
 		case <-s.fail:
 			s.end()
-			return connectedAt, s.closedErr()
+			return connectedAt, true, s.closedErr()
 		case err := <-pingErr:
 			s.closeGracefully(1000, "")
-			return connectedAt, err
+			return connectedAt, true, err
 		case m := <-s.initCh:
 			// The appliance restarted the handshake on the same socket.
 			c.log.Warn("appliance re-sent /ei/initialValues; redoing the handshake")
 			info, snapFailed, err := setup(m)
 			if err != nil {
 				s.closeGracefully(1000, "")
-				return connectedAt, fmt.Errorf("re-handshake: %w", err)
+				return connectedAt, true, fmt.Errorf("re-handshake: %w", err)
 			}
 			c.emit(Event{Kind: EvInfo, Info: info})
 			resync.Stop()
@@ -396,7 +407,7 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 			var te *TimeoutError
 			if err != nil && !errors.As(err, &re) && !errors.As(err, &te) {
 				s.closeGracefully(1000, "")
-				return connectedAt, fmt.Errorf("resync: %w", err)
+				return connectedAt, true, fmt.Errorf("resync: %w", err)
 			}
 			schedule(err) // an error answer or a timeout: read again soon
 		}
@@ -405,16 +416,22 @@ func (c *Client) runSession(ctx context.Context) (connectedAt time.Time, err err
 
 // setLink records and reports a link state. Retries in the same state do
 // not re-emit, so Since marks the start of the episode.
-func (c *Client) setLink(state LinkState, err error) {
+func (c *Client) setLink(state LinkState, err error) { c.setLinkAfter(state, err, false) }
+
+// setLinkAfter is setLink for a failed attempt that may have got past the
+// upgrade. A change of upgraded alone is reported as well, with Since
+// unchanged: the bridge's refusal clock has to learn that the appliance
+// accepted a session in between, even if the state stays "error".
+func (c *Client) setLinkAfter(state LinkState, err error, upgraded bool) {
 	c.mu.Lock()
 	prev := c.link
 	now := time.Now()
 	changed := prev.State != state
 	if changed {
-		c.link = LinkStatus{State: state, Since: now, Err: err}
+		c.link = LinkStatus{State: state, Since: now, Err: err, Upgraded: upgraded}
 		c.lastLogged = now
 	} else {
-		c.link.Err = err
+		c.link.Err, c.link.Upgraded = err, upgraded
 	}
 	if state != LinkConnected && state != LinkConnecting {
 		c.link.Attempts++
@@ -440,7 +457,7 @@ func (c *Client) setLink(state LinkState, err error) {
 	case err != nil:
 		c.log.Debug("local link %s: %v", state, err)
 	}
-	if changed {
+	if changed || prev.Upgraded != upgraded {
 		c.emit(Event{Kind: EvLink, Link: st})
 	}
 }

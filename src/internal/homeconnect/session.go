@@ -450,16 +450,20 @@ func (s *session) handshake(ctx context.Context, init *Message) (*DeviceInfo, er
 
 // snapshot reads every value (/ro/allMandatoryValues; dispatch emits them
 // ahead of anything pushed later). Some firmware answers 500 or is slow
-// here: one retry on timeout, and an error answer leaves the session up
-// (pushes still arrive) but comes back as failed, so the caller reads again
-// soon. Any other failure (err) ends the session.
+// here: a timeout is retried once at once, and an error answer or a second
+// timeout leaves the session up (pushes still arrive; dropping it would be
+// the kind of disconnect the client avoids) but comes back as failed, so
+// the caller reads again soon. Any other failure (err) ends the session.
 func (s *session) snapshot(ctx context.Context) (failed, err error) {
 	for attempt := 0; ; attempt++ {
 		_, err := s.get(ctx, "/ro/allMandatoryValues", s.version("/ro"), nil)
 		var te *TimeoutError
-		if errors.As(err, &te) && attempt == 0 {
-			s.c.log.Warn("/ro/allMandatoryValues timed out; retrying once")
-			continue
+		if errors.As(err, &te) {
+			if attempt == 0 {
+				s.c.log.Warn("/ro/allMandatoryValues timed out; retrying once")
+				continue
+			}
+			return err, nil
 		}
 		var re *RequestError
 		if errors.As(err, &re) {

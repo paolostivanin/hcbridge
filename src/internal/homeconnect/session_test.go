@@ -304,3 +304,127 @@ func TestFramesAfterADesyncAreDiscarded(t *testing.T) {
 		}
 	}
 }
+
+// Whether a failed attempt got past the upgrade is reported, and a change
+// of it alone produces an event (the state stays "error", Since unchanged).
+func TestUpgradedIsReported(t *testing.T) {
+	srv := newServer(t)
+	srv.SetSendInit(false) // accepted, then no initialValues: error, upgraded
+	h := start(t, srv, func(o *hc.Options) { o.InitTimeout = 30 * time.Millisecond })
+	waitFor(t, 3*time.Second, "an upgraded error", func() bool {
+		for _, l := range h.rec.links() {
+			if l.State == hc.LinkError && l.Upgraded {
+				return true
+			}
+		}
+		return false
+	})
+	srv.Refuse(500, nil, "") // not accepted: still error, not upgraded
+	waitFor(t, 3*time.Second, "the change reported", func() bool {
+		ls := h.rec.links()
+		last := ls[len(ls)-1]
+		return last.State == hc.LinkError && !last.Upgraded
+	})
+	var since []time.Time
+	for _, l := range h.rec.links() {
+		if l.State == hc.LinkError {
+			since = append(since, l.Since)
+		}
+	}
+	if len(since) < 2 || !since[0].Equal(since[len(since)-1]) {
+		t.Fatalf("error episode start moved: %v", since)
+	}
+}
+
+// Two snapshot timeouts at connect no longer drop the session: it stays up
+// and the read is retried on it.
+func TestSnapshotTimeoutsKeepTheSession(t *testing.T) {
+	srv := newServer(t)
+	srv.FailResource("/ro/allMandatoryValues", -1)
+	h := start(t, srv, func(o *hc.Options) {
+		o.RequestTimeout = 40 * time.Millisecond
+		o.SnapshotRetryMin, o.SnapshotRetryMax = 30*time.Millisecond, 60*time.Millisecond
+	})
+	h.rec.waitLink(t, hc.LinkConnected, 1)
+	srv.SetValues(map[int]any{4409: 18})
+	srv.FailResource("/ro/allMandatoryValues", 0)
+	waitFor(t, 3*time.Second, "the snapshot", func() bool {
+		for _, ev := range valueEvents(h.rec) {
+			if ev.Snapshot && len(ev.Values) > 0 {
+				return true
+			}
+		}
+		return false
+	})
+	if srv.Sessions() != 1 || len(srv.CloseCodes()) != 0 {
+		t.Fatalf("sessions %d, closes %v: the session must survive slow snapshots", srv.Sessions(), srv.CloseCodes())
+	}
+}
+
+func mandatoryReads(srv *hcfake.Server) int {
+	n := 0
+	for _, m := range srv.Received() {
+		if m.Resource == "/ro/allMandatoryValues" {
+			n++
+		}
+	}
+	return n
+}
+
+// The retries back off: with 20 ms doubling to 160 ms, 500 ms hold about
+// 5 reads, not the 25 a fixed 20 ms would give.
+func TestSnapshotRetriesBackOff(t *testing.T) {
+	srv := newServer(t)
+	srv.FailMandatory(500, false)
+	h := start(t, srv, func(o *hc.Options) {
+		o.SnapshotRetryMin, o.SnapshotRetryMax = 20*time.Millisecond, 160*time.Millisecond
+	})
+	h.rec.waitLink(t, hc.LinkConnected, 1)
+	time.Sleep(500 * time.Millisecond)
+	if n := mandatoryReads(srv); n < 3 || n > 9 {
+		t.Fatalf("%d reads in 500 ms, want about 5 (doubling)", n)
+	}
+}
+
+// A re-handshake whose snapshot fails schedules a retry, even when the
+// session had a good snapshot (and so a 6-hour resync) before.
+func TestRehandshakeSnapshotFailureIsRetried(t *testing.T) {
+	srv := newServer(t)
+	h := start(t, srv, func(o *hc.Options) {
+		o.SnapshotRetryMin, o.SnapshotRetryMax = 20*time.Millisecond, 40*time.Millisecond
+	})
+	h.rec.waitLink(t, hc.LinkConnected, 1)
+	srv.FailMandatory(500, false)
+	srv.Reinit()
+	waitFor(t, 2*time.Second, "retries after the re-handshake", func() bool { return mandatoryReads(srv) >= 4 })
+}
+
+// After a cancelled upgrade the client sends nothing but the Close. (The
+// race the check guards, initialValues already decoded when the select
+// runs, is rare; this test describes the behaviour more than it catches a
+// regression.)
+func TestNoHandshakeAfterACancelledUpgrade(t *testing.T) {
+	srv := newServer(t)
+	srv.SetUpgradeDelay(150 * time.Millisecond)
+	h := start(t, srv, nil)
+	waitFor(t, 2*time.Second, "the dial", func() bool { return len(srv.DialTimes()) == 1 })
+	h.stop()
+	if got := srv.Received(); len(got) != 0 {
+		t.Fatalf("the client sent %d messages after shutdown was requested: %s", len(got), got[0].Resource)
+	}
+}
+
+// ResumeBackoff above BackoffMax is capped.
+func TestResumeBackoffIsCapped(t *testing.T) {
+	srv := newServer(t)
+	srv.Refuse(503, nil, "")
+	h := start(t, srv, func(o *hc.Options) {
+		o.BackoffMin, o.BackoffMax, o.ResumeBackoff = 10*time.Millisecond, 60*time.Millisecond, time.Hour
+	})
+	waitFor(t, 3*time.Second, "two dials", func() bool { return len(srv.DialTimes()) >= 2 })
+	h.stop()
+	d := srv.DialTimes()
+	if gap := d[1].Sub(d[0]); gap > 500*time.Millisecond {
+		t.Fatalf("second dial %s after the first; ResumeBackoff must be capped at BackoffMax", gap)
+	}
+}

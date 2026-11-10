@@ -68,6 +68,47 @@ func TestExpiredGraceCannotOverrideARecoveredSession(t *testing.T) {
 	}
 }
 
+// The grace callback and a recovery race: whichever runs first, the session
+// is up, so the link ends online.
+func TestGraceExpiryCannotOverrideARecovery(t *testing.T) {
+	cfg := testConfig()
+	cfg.StateDirectory = t.TempDir()
+	for i := 0; i < 300; i++ {
+		c := newController(cfg, hcfake.Profile(), "0a1b2c3d", newTestBridge(), quietLogger())
+		c.offlineGrace = time.Hour
+		c.streamUpNow()
+		c.streamDown()
+		c.streamMu.Lock()
+		gen := c.streamGen
+		c.streamMu.Unlock()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); c.offlineExpired(gen) }()
+		go func() { defer wg.Done(); c.streamUpNow() }()
+		wg.Wait()
+		if got, _ := c.bridge.get("link"); got != "online" {
+			t.Fatalf("run %d: link = %q with the session up", i, got)
+		}
+	}
+}
+
+// At startup the data is already marked unavailable: a failing first
+// attempt starts no grace timer (and logs no second "marking unavailable").
+func TestColdStartNeedsNoGrace(t *testing.T) {
+	srv := hcfake.New()
+	defer srv.Close()
+	srv.Refuse(503, nil, "")
+	h := startController(t, srv)
+	h.wait(t, "status/link_state", "refused")
+	h.c.streamMu.Lock()
+	timer := h.c.offlineTimer
+	h.c.streamMu.Unlock()
+	if timer != nil {
+		t.Fatal("a grace timer runs although the link is already offline")
+	}
+	h.wait(t, "link", "offline")
+}
+
 // The threshold check and a recovery race: whichever runs first, the hob is
 // connected in the end, on MQTT and in link.json.
 func TestThresholdCheckCannotOverrideARecovery(t *testing.T) {
@@ -228,11 +269,10 @@ func TestControllerShutdownWaitsForAnUpgradeInProgress(t *testing.T) {
 		t.Fatal("no dial")
 	}
 	h.stop()
-	if !waitFor(t, 2*time.Second, func() bool { return len(srv.CloseCodes()) == 1 }) {
-		t.Fatalf("session not closed: close codes %v", srv.CloseCodes())
-	}
-	if codes := srv.CloseCodes(); codes[0] != 1000 {
-		t.Fatalf("close codes %v, want 1000", codes)
+	// No waiting here: in a real process nothing runs after run returns.
+	time.Sleep(10 * time.Millisecond) // the fake records the code a moment after answering
+	if codes := srv.CloseCodes(); len(codes) != 1 || codes[0] != 1000 {
+		t.Fatalf("close codes %v when run returned, want [1000]", codes)
 	}
 }
 
