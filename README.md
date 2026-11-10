@@ -307,6 +307,10 @@ Mosquitto container:
 make e2e
 ```
 
+GitHub Actions (`.github/workflows/ci.yml`) runs the same on every push and
+pull request to `main`: gofmt, `go mod tidy`, vet, a static build, the race
+tests, staticcheck, govulncheck and the end-to-end test.
+
 ## Verify with MQTT
 
 ```sh
