@@ -386,6 +386,25 @@ func TestPowerOffResetCancelledByPowerOn(t *testing.T) {
 	want(t, b, "zone/front_left/power", "5")
 }
 
+// Off, On, Off in quick succession: the first Off's reset must not fire
+// inside the second Off's grace, which belongs to the hob to report its zones.
+func TestPowerOffResetBelongsToTheLatestOff(t *testing.T) {
+	b := newTestBridge()
+	b.powerOffDelay = 300 * time.Millisecond
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"),
+		sym("Cooking.Hob.Status.Zone.100.State", "Active"), sym("Cooking.Hob.Status.Zone.100.PowerLevel", "50"))
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off")) // its grace ends at 300 ms
+	time.Sleep(150 * time.Millisecond)
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"))
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off")) // this grace ends at 450 ms
+	time.Sleep(200 * time.Millisecond)                    // 350 ms: past the first, inside the second
+	want(t, b, "zone/front_left/state", "active")
+	want(t, b, "zone/front_left/power", "5")
+	if !waitFor(t, 2*time.Second, func() bool { v, _ := b.get("zone/front_left/state"); return v == "off" }) {
+		t.Fatal("the latest Off's reset never ran")
+	}
+}
+
 // A value that is not there (a JSON null in an access change) must not erase
 // the retained filter state, but a value carried by its symbol still applies.
 func TestApplyDescriptionsIgnoresAValueThatIsNotThere(t *testing.T) {

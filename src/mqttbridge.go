@@ -117,6 +117,8 @@ type Bridge struct {
 	meta          deviceMeta
 
 	powerOffDelay time.Duration // powerOffGrace; zero resets synchronously (tests)
+	powerGen      uint64        // bumped on every PowerState value: identifies the Off a reset belongs to
+	powerTimer    *time.Timer   // the pending power-off reset
 
 	discoveryMu sync.Mutex
 }
@@ -733,26 +735,51 @@ func (b *Bridge) applyKV(key string, value interface{}, snapshot bool) {
 	payload := formatValue(key, value)
 	b.publish(suffix, payload) // throttledSuffixes are rate-limited by the sender
 
-	if key == "BSH.Common.Setting.PowerState" && payload == "Off" {
-		b.schedulePowerOffReset()
+	if key == "BSH.Common.Setting.PowerState" {
+		b.powerStateChanged(payload == "Off")
 	}
 }
 
-// schedulePowerOffReset runs resetOnPowerOff after the grace, if the hob is
-// still off by then (it may have been switched on again).
-func (b *Bridge) schedulePowerOffReset() {
-	if b.powerOffDelay <= 0 {
-		b.resetOnPowerOff()
-		return
+// powerStateChanged starts a new power generation: whatever reset an
+// earlier Off scheduled is cancelled, and an Off schedules its own, which
+// runs after the grace only if no PowerState value has arrived since. So in
+// Off, On, Off the first Off's reset cannot fire inside the second's grace.
+func (b *Bridge) powerStateChanged(off bool) {
+	b.mu.Lock()
+	b.powerGen++
+	gen := b.powerGen
+	if b.powerTimer != nil {
+		b.powerTimer.Stop()
+		b.powerTimer = nil
 	}
-	time.AfterFunc(b.powerOffDelay, func() {
-		b.mu.Lock()
-		off := b.lastPub["status/power_state"] == "Off"
-		b.mu.Unlock()
-		if off {
-			b.resetOnPowerOff()
+	changed := false
+	if off {
+		if b.powerOffDelay <= 0 {
+			changed = b.resetOnPowerOffLocked()
+		} else {
+			b.powerTimer = time.AfterFunc(b.powerOffDelay, func() { b.powerOffExpired(gen) })
 		}
-	})
+	}
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
+}
+
+// powerOffExpired runs the reset of power generation gen, unless a newer
+// PowerState value superseded it. Check and reset are one critical section,
+// so a zone update cannot slip in between and be overwritten.
+func (b *Bridge) powerOffExpired(gen uint64) {
+	b.mu.Lock()
+	changed := false
+	if gen == b.powerGen && b.lastPub["status/power_state"] == "Off" {
+		b.powerTimer = nil
+		changed = b.resetOnPowerOffLocked()
+	}
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
 }
 
 // applyZone handles Cooking.Hob.Status.Zone.<id>.<attr>.
@@ -883,29 +910,24 @@ func (b *Bridge) updateDeadlineLocked(suffix string, remainingSecs int) bool {
 // pair is joined. The hob pushes all of this itself right after power-off;
 // resetting here (after powerOffGrace) covers a missed push. Residual heat is
 // kept: the hob reports it after power-off.
-func (b *Bridge) resetOnPowerOff() {
-	b.mu.Lock()
-	for _, z := range b.zones {
+// Called with b.mu held; reports whether anything changed.
+func (b *Bridge) resetOnPowerOffLocked() bool {
+	changed := false
+	for _, name := range allZones {
+		z := b.zones[name]
 		z.power = "off"
 		if z.state == "Active" {
 			z.state = "Off"
 		}
 		z.op = ""
+		slug := zoneSlug(name)
+		changed = b.publishLocked("zone/"+slug+"/power", "off") || changed
+		changed = b.publishLocked("zone/"+slug+"/state", zoneStateLabel(z.state, z.op)) || changed
+		changed = b.updateDeadlineLocked("zone/"+slug+"/timer_deadline", 0) || changed
 	}
 	b.joinFlag = map[string]bool{}
-	labels := map[string]string{}
-	for name, z := range b.zones {
-		labels[name] = zoneStateLabel(z.state, z.op)
-	}
-	b.mu.Unlock()
-	for _, z := range allZones {
-		slug := zoneSlug(z)
-		b.publish("zone/"+slug+"/power", "off")
-		b.publish("zone/"+slug+"/state", labels[z])
-		b.updateDeadline("zone/"+slug+"/timer_deadline", 0)
-	}
-	b.updateDeadline("status/program_timer_deadline", 0)
-	b.publishJoins()
+	changed = b.updateDeadlineLocked("status/program_timer_deadline", 0) || changed
+	return b.publishJoinsLocked() || changed
 }
 
 // PublishLink publishes the local link's health. These topics are not gated
