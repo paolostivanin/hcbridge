@@ -91,6 +91,7 @@ type Server struct {
 	refuseHeader  http.Header
 	refuseBody    string
 	pong          bool
+	upgradeDelay  time.Duration
 	corruptNext   bool
 	ci, ei        int
 	iz, ni        bool
@@ -146,6 +147,9 @@ func (s *Server) Refuse(status int, header http.Header, body string) {
 	defer s.mu.Unlock()
 	s.refuse, s.refuseHeader, s.refuseBody = status, header, body
 }
+
+// SetUpgradeDelay makes the appliance take d to answer each upgrade.
+func (s *Server) SetUpgradeDelay(d time.Duration) { s.mu.Lock(); s.upgradeDelay = d; s.mu.Unlock() }
 
 // SetPong turns answering pings on or off.
 func (s *Server) SetPong(on bool) { s.mu.Lock(); s.pong = on; s.mu.Unlock() }
@@ -273,7 +277,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.dialTimes = append(s.dialTimes, time.Now())
 	refuse, hdr, body := s.refuse, s.refuseHeader, s.refuseBody
 	psk, iv := s.psk, s.iv
+	delay := s.upgradeDelay
 	s.mu.Unlock()
+	time.Sleep(delay) // a slow appliance: the client waits for the answer
 
 	if r.URL.Path != "/homeconnect" {
 		http.NotFound(w, r)

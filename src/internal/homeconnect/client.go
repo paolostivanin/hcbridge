@@ -171,6 +171,20 @@ type Client struct {
 	mu         sync.Mutex
 }
 
+// closeWait bounds each half of the WebSocket Close handshake: sending our
+// Close, then waiting for the appliance's.
+const closeWait = 2 * time.Second
+
+// ShutdownTimeout is the longest Run can take to return once its context
+// is cancelled. An upgrade in progress cannot be cut short cleanly (the
+// appliance is in the middle of answering, and the WebSocket library does
+// not watch the context), so it runs to UpgradeTimeout, and the session it
+// opens is then closed with a Close handshake. Give Run at least this long
+// on shutdown, or the process exits with the connection half-open.
+func (c *Client) ShutdownTimeout() time.Duration {
+	return c.opts.UpgradeTimeout + 2*closeWait + time.Second
+}
+
 // NewClient validates the options. Run does the work.
 func NewClient(o Options, p *Profile, h func(Event)) (*Client, error) {
 	o.setDefaults()

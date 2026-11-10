@@ -557,10 +557,10 @@ func (s *session) pingLoop(ctx context.Context, errc chan<- error) {
 // answer it (its server closes the TCP connection first), then closes the
 // socket. Never just drop a connection the appliance still believes in.
 func (s *session) closeGracefully(code int, reason string) {
-	_ = s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(2*time.Second))
+	_ = s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(closeWait))
 	select {
 	case <-s.done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(closeWait):
 	}
 	s.conn.Close()
 	<-s.done

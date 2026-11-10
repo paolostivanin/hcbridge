@@ -373,6 +373,40 @@ func TestResumeBackoff(t *testing.T) {
 	}
 }
 
+// Cancelled during a slow upgrade, Run lets the upgrade finish and closes
+// the session it opened with Close 1000, never dropping it half-open; and
+// ShutdownTimeout covers that worst case.
+func TestShutdownDuringUpgradeClosesCleanly(t *testing.T) {
+	srv := newServer(t)
+	srv.SetUpgradeDelay(300 * time.Millisecond)
+	h := start(t, srv, func(o *hc.Options) { o.UpgradeTimeout = 2 * time.Second })
+	waitFor(t, 2*time.Second, "the dial", func() bool { return len(srv.DialTimes()) == 1 })
+	began := time.Now()
+	h.stop() // SIGTERM while the hob is still answering the upgrade
+	if d := time.Since(began); d < 150*time.Millisecond {
+		t.Fatalf("Run returned after %s, before the upgrade could finish", d)
+	}
+	waitFor(t, 2*time.Second, "the close", func() bool { return len(srv.CloseCodes()) == 1 })
+	if codes := srv.CloseCodes(); codes[0] != 1000 {
+		t.Fatalf("close codes %v, want 1000", codes)
+	}
+}
+
+func TestShutdownTimeoutCoversAnUpgradeAndTheClose(t *testing.T) {
+	for _, upgrade := range []time.Duration{0, 2 * time.Second} {
+		c, err := hc.NewClient(hc.Options{Host: "192.0.2.1", DeviceID: testDeviceID, Log: &testLogger{t: t}, UpgradeTimeout: upgrade}, hcfake.Profile(), func(hc.Event) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if upgrade == 0 {
+			upgrade = 15 * time.Second // the default
+		}
+		if got, min := c.ShutdownTimeout(), upgrade+4*time.Second; got < min {
+			t.Errorf("UpgradeTimeout %s: ShutdownTimeout %s, want at least %s (upgrade + Close handshake)", upgrade, got, min)
+		}
+	}
+}
+
 func TestMalformedMessageKeepsSession(t *testing.T) {
 	srv := newServer(t)
 	h := start(t, srv, nil)

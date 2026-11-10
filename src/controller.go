@@ -20,8 +20,6 @@ const (
 	heartbeatEvery = 5 * time.Minute  // MQTT heartbeat for HA
 	aliveEvery     = time.Minute      // liveness file for the OpenRC healthcheck
 	linkEvalEvery  = 30 * time.Second // power_cycle_needed threshold check
-
-	shutdownWait = 5 * time.Second // for the client's Close handshake
 )
 
 // controller connects the local client to the bridge: values go to MQTT,
@@ -118,10 +116,15 @@ func (c *controller) run(ctx context.Context, cancel context.CancelFunc, sigCh <
 		case sig := <-sigCh:
 			c.log.Info("got signal %s, shutting down", sig)
 			cancel()
+			// Long enough for an upgrade in progress to finish and its
+			// session to be closed with a Close frame: exiting earlier
+			// drops the connection on the hob, the kind of abrupt
+			// disconnect its firmware may answer with days of 503s.
+			wait := client.ShutdownTimeout()
 			select {
 			case <-done:
-			case <-time.After(shutdownWait):
-				c.log.Warn("local session did not close within %s", shutdownWait)
+			case <-time.After(wait):
+				c.log.Warn("local session did not close within %s", wait)
 			}
 			c.link.save()
 			return

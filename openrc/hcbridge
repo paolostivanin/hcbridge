@@ -23,8 +23,10 @@ command_user="hcbridge:hcbridge"
 pidfile="/run/${RC_SVCNAME}.pid"
 respawn_delay=10
 respawn_max=0
-# SIGTERM first: the bridge closes its session with the hob cleanly.
-retry="SIGTERM/15/SIGKILL/5"
+# SIGTERM first: the bridge closes its session with the hob cleanly. That
+# takes up to 20 s (an upgrade in progress runs to its 15 s timeout, then
+# the Close handshake), plus about 5 s for MQTT.
+retry="SIGTERM/30/SIGKILL/5"
 output_log="/var/log/hcbridge/stdout.log"
 error_log="/var/log/hcbridge/stderr.log"
 umask=077

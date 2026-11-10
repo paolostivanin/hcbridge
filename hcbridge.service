@@ -15,8 +15,10 @@ ExecStart=/opt/hcbridge/hcbridge --mode=run --config=/etc/hcbridge/config.yaml
 # -------------------------------------------------------------------
 Restart=always
 RestartSec=10
-# Room for the Close handshake with the hob on stop.
-TimeoutStopSec=15
+# Room for a clean stop: up to 20 s to close the session with the hob (an
+# upgrade in progress runs to its 15 s timeout, then the Close handshake),
+# then about 5 s to drain MQTT and announce offline.
+TimeoutStopSec=30
 
 # -------------------------------------------------------------------
 # Security Hardening

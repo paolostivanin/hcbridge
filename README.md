@@ -143,7 +143,9 @@ connection:
   slowly; a 10 s timeout dropped the connection dozens of times a day in
   other projects); any frame counts as a sign of life
 - no `Origin` header (the hob ignores upgrades that carry one)
-- a clean WebSocket Close before every deliberate disconnect and on shutdown
+- a clean WebSocket Close before every deliberate disconnect and on shutdown;
+  a stop during a connection attempt lets the upgrade finish (at most 15 s)
+  and closes that session cleanly too, so the service files allow 30 s to stop
 - reconnects back off from 5 s to 5 min with jitter; the last dial and the
   spacing reached survive a restart (and carry over between the service and
   `local-watch`), so neither a crash loop nor a diagnostic run hammers the hob

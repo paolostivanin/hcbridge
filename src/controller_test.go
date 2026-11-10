@@ -216,6 +216,25 @@ func TestControllerRefusalRaisesPowerCycleFlag(t *testing.T) {
 	h.wait(t, "link", "online")
 }
 
+// A stop while the hob is still answering the upgrade waits for it and
+// closes the new session cleanly, instead of exiting with it half-open.
+func TestControllerShutdownWaitsForAnUpgradeInProgress(t *testing.T) {
+	srv := hcfake.New()
+	defer srv.Close()
+	srv.SetUpgradeDelay(400 * time.Millisecond)
+	h := startController(t, srv)
+	if !waitFor(t, 2*time.Second, func() bool { return len(srv.DialTimes()) == 1 }) {
+		t.Fatal("no dial")
+	}
+	h.stop()
+	if !waitFor(t, 2*time.Second, func() bool { return len(srv.CloseCodes()) == 1 }) {
+		t.Fatalf("session not closed: close codes %v", srv.CloseCodes())
+	}
+	if codes := srv.CloseCodes(); codes[0] != 1000 {
+		t.Fatalf("close codes %v, want 1000", codes)
+	}
+}
+
 // A restart mid-episode keeps the clock and waits before the first dial.
 func TestControllerRestoresEpisode(t *testing.T) {
 	srv := hcfake.New()
