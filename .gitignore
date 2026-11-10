@@ -20,5 +20,5 @@
 /lock
 obs-*.jsonl
 # ...except the synthetic test profile (fake key, not a real appliance).
-!internal/homeconnect/hcfake/profile/
-!internal/homeconnect/hcfake/profile/*
+!src/internal/homeconnect/hcfake/profile/
+!src/internal/homeconnect/hcfake/profile/*

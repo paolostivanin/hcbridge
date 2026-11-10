@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 func want(t *testing.T, b *Bridge, suffix, value string) {

@@ -42,7 +42,7 @@ jobs:
       # Static like the release build (make release), so a stray cgo
       # dependency fails here and not on the Alpine box.
       - name: Build
-        run: CGO_ENABLED=0 go build -trimpath -o /dev/null .
+        run: CGO_ENABLED=0 go build -trimpath -o /dev/null ./src
 
       - name: Test (race detector)
         run: go test -race ./...

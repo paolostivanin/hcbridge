@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 func TestLinkMonitorLatch(t *testing.T) {

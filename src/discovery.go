@@ -7,7 +7,7 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 // discoveryEntity is one HA MQTT discovery config.

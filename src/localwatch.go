@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 // --mode=local-watch connects to the appliance like the service does (same

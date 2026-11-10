@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 const (

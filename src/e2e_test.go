@@ -22,8 +22,8 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
-	hc "hcbridge/internal/homeconnect"
-	"hcbridge/internal/homeconnect/hcfake"
+	hc "hcbridge/src/internal/homeconnect"
+	"hcbridge/src/internal/homeconnect/hcfake"
 )
 
 type retained struct {

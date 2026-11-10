@@ -83,7 +83,7 @@ log_level: "INFO"
 
 // The shipped example must stay loadable.
 func TestConfigExampleLoads(t *testing.T) {
-	c, err := LoadConfig("config.example.yaml")
+	c, err := LoadConfig("../config.example.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

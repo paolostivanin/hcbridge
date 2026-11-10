@@ -7,7 +7,7 @@ BIN := hcbridge
 .PHONY: build test check e2e release clean
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $(BIN) .
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $(BIN) ./src
 
 test:
 	go vet ./...
@@ -24,7 +24,7 @@ e2e:
 
 release: test
 	@test -z "$$(git status --porcelain)" || { echo "refusing: working tree is dirty"; exit 1; }
-	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $(BIN) .
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $(BIN) ./src
 	@./$(BIN) --version
 	@sha256sum $(BIN)
 

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
-	"hcbridge/internal/homeconnect/hcfake"
+	hc "hcbridge/src/internal/homeconnect"
+	"hcbridge/src/internal/homeconnect/hcfake"
 )
 
 const testDeviceID = "0a1b2c3d"

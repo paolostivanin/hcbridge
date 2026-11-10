@@ -21,7 +21,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 //go:embed profile

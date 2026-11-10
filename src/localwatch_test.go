@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"hcbridge/internal/homeconnect/hcfake"
+	"hcbridge/src/internal/homeconnect/hcfake"
 )
 
 func localTestConfig(t *testing.T, host string) *Config {

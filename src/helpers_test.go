@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 func quietLogger() *Logger { return NewLogger("/dev/null", "ERROR") }

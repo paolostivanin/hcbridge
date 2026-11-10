@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
-	"hcbridge/internal/homeconnect/hcfake"
+	hc "hcbridge/src/internal/homeconnect"
+	"hcbridge/src/internal/homeconnect/hcfake"
 )
 
 func TestLinkGraceSurvivesQuickReconnect(t *testing.T) {

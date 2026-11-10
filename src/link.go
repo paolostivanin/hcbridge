@@ -3,7 +3,7 @@ package main
 import (
 	"time"
 
-	hc "hcbridge/internal/homeconnect"
+	hc "hcbridge/src/internal/homeconnect"
 )
 
 // linkMonitor turns the client's link states into the power_cycle_needed
