@@ -4,7 +4,7 @@
 
 A small single-binary bridge from a Bosch/Siemens/Neff (BSH) hob to MQTT,
 written in Go, speaking the appliance's **local** Home Connect protocol: no
-cloud at runtime, no API quota, no OAuth. Version 2.0.1 (`hcbridge --version`).
+cloud at runtime, no API quota, no OAuth. Version 2.1.0 (`hcbridge --version`).
 
 ## Contents
 
