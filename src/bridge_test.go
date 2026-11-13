@@ -137,6 +137,102 @@ func TestTimers(t *testing.T) {
 	}
 }
 
+// Seen 2026-11-12 19:07: the panel is touched, the zone timer stands still at
+// its new 7:00 until the panel is released about 10 s later, then the hob
+// pushes it again and starts it. Only the started timer reaches HA.
+func TestTimerHeldWhilePanelTouched(t *testing.T) {
+	b := newTestBridge()
+	b.settleDelay = 200 * time.Millisecond
+	const suffix = "zone/front_left/timer_deadline"
+	out := capture(b)
+	touch := func(on bool) { apply(b, boolv("BSH.Common.Status.LocalControlActive", on)) }
+	timer := func(s float64) { apply(b, num("Cooking.Hob.Status.Zone.100.RemainingProgramTime", s)) }
+
+	touch(true)
+	timer(60)  // the "1" of 12 minutes
+	timer(720) // standing still while the panel is touched
+	if got := sent(b, out, suffix); len(got) != 0 {
+		t.Fatalf("published while touched: %v", got)
+	}
+	want(t, b, "status/local_control", "true") // still published itself
+	touch(false)
+	time.Sleep(10 * time.Millisecond)
+	start := time.Now()
+	timer(725)                         // the hob's push at release, within timerSettle
+	time.Sleep(300 * time.Millisecond) // past timerSettle: nothing stale follows
+	got := sent(b, out, suffix)
+	if len(got) != 1 {
+		t.Fatalf("sent %v, want only the started timer", got)
+	}
+	if d, err := time.Parse(time.RFC3339, got[0]); err != nil || d.Sub(start) < 723*time.Second || d.Sub(start) > 726*time.Second {
+		t.Fatalf("deadline %q (%v)", got[0], err)
+	}
+
+	// Touched for something else (a power change) while the timer runs: its
+	// next push is held, then dropped by the jitter filter.
+	touch(true)
+	timer(724)
+	touch(false)
+	time.Sleep(300 * time.Millisecond)
+	if got := sent(b, out, suffix); len(got) != 1 {
+		t.Fatalf("running timer republished: %v", got)
+	}
+
+	// Changed while touched, released without a push: the held value goes
+	// out after timerSettle.
+	touch(true)
+	timer(120)
+	touch(false)
+	if !waitFor(t, time.Second, func() bool { return len(sent(b, out, suffix)) == 2 }) {
+		t.Fatalf("held deadline never published: %v", sent(b, out, suffix))
+	}
+
+	// Touched again before timerSettle: the held value waits for the new
+	// release.
+	touch(true)
+	timer(300)
+	touch(false)
+	touch(true)
+	time.Sleep(300 * time.Millisecond)
+	if got := sent(b, out, suffix); len(got) != 2 {
+		t.Fatalf("published while touched again: %v", got)
+	}
+	touch(false)
+	if !waitFor(t, time.Second, func() bool { return len(sent(b, out, suffix)) == 3 }) {
+		t.Fatalf("held deadline never published: %v", sent(b, out, suffix))
+	}
+
+	// Cleared while touched: at once.
+	touch(true)
+	timer(0)
+	want(t, b, suffix, noValue)
+	touch(false)
+}
+
+// A timer held while the panel is touched does not outlive a power-off, and
+// a panel touched for longer than holdMax still gets its timer out.
+func TestTimerHoldLimits(t *testing.T) {
+	b := newTestBridge()
+	b.settleDelay = 20 * time.Millisecond
+	apply(b, sym("BSH.Common.Setting.PowerState", "On"), boolv("BSH.Common.Status.LocalControlActive", true))
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 300))
+	apply(b, sym("BSH.Common.Setting.PowerState", "Off"), boolv("BSH.Common.Status.LocalControlActive", false))
+	time.Sleep(60 * time.Millisecond)
+	want(t, b, "zone/rear_left/timer_deadline", noValue)
+
+	b.holdMax = 30 * time.Millisecond
+	apply(b, boolv("BSH.Common.Status.LocalControlActive", true))
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 300))
+	if got, _ := b.get("zone/rear_left/timer_deadline"); got != noValue {
+		t.Fatalf("published at once while touched: %q", got)
+	}
+	time.Sleep(40 * time.Millisecond)
+	apply(b, num("Cooking.Hob.Status.Zone.200.RemainingProgramTime", 299))
+	if got, _ := b.get("zone/rear_left/timer_deadline"); got == noValue {
+		t.Fatal("timer held past holdMax")
+	}
+}
+
 func TestEventsAreNotRetainedAndSkippedInSnapshots(t *testing.T) {
 	b := newTestBridge()
 	out := capture(b)

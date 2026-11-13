@@ -126,6 +126,12 @@ type Bridge struct {
 	dryMu    sync.Mutex    // dry run: one drain at a time, so lines stay in order
 
 	deadlines     map[string]time.Time // last published timer deadline per suffix
+	localControl  bool                 // the panel is being touched (LocalControlActive)
+	held          map[string]time.Time // deadlines that arrived while it was, newest per suffix
+	heldSince     time.Time            // when the oldest held deadline arrived
+	flushTimer    *time.Timer          // publishes the held deadlines after the panel is released
+	settleDelay   time.Duration        // timerSettle; zero flushes synchronously (tests)
+	holdMax       time.Duration        // maxTimerHold; a field so tests can shrink it
 	unmapped      map[string]bool      // unmapped keys already logged
 	zones         map[string]*zoneObs  // by zone name (FrontLeft, ...)
 	selector      string               // the zone the panel has focus on
@@ -160,12 +166,15 @@ func NewBridge(cfg *Config, meta deviceMeta, log *Logger) *Bridge {
 		stopCh:    make(chan struct{}),
 		loopDone:  make(chan struct{}),
 		deadlines: map[string]time.Time{},
+		held:      map[string]time.Time{},
 		unmapped:  map[string]bool{},
 		zones:     map[string]*zoneObs{},
 		joinFlag:  map[string]bool{},
 		meta:      meta,
 
 		powerOffDelay: powerOffGrace,
+		settleDelay:   timerSettle,
+		holdMax:       maxTimerHold,
 	}
 	for _, z := range allZones {
 		b.zones[z] = &zoneObs{}
@@ -747,12 +756,20 @@ func (b *Bridge) applyKV(key string, value interface{}, snapshot bool) {
 
 	switch key {
 	case "BSH.Common.Option.RemainingProgramTime":
-		// Published only as a wall-clock deadline so HA renders a live
-		// countdown; the hob pushes the remaining seconds every second.
+		// Published only as a wall-clock deadline. This is the timer of the
+		// zone the panel has focus on, not the hob's soonest timer: it read
+		// no value while front-right had focus and front-left's timer ran
+		// (2026-11-09 18:42, cloud API). The zone timers are the reliable
+		// source.
 		if secs, ok := value.(float64); ok {
 			b.updateDeadline("status/program_timer_deadline", int(secs))
 		}
 		return
+	case "BSH.Common.Status.LocalControlActive":
+		// Also published below; the timer hold needs it first.
+		if on, ok := value.(bool); ok {
+			b.setLocalControl(on)
+		}
 	case "Cooking.Hob.Option.ZoneSelector":
 		zone := cleanEnum(value)
 		b.mu.Lock()
@@ -925,14 +942,38 @@ func (b *Bridge) updateCarbon() {
 }
 
 // timerJitter is how far a computed deadline may drift before it is
-// republished. Remaining times are pushed every second, and
-// now+remaining wobbles by about a second each time; republishing every
-// wobble only churns the recorder.
+// republished. now+remaining wobbles by about a second from push to push
+// (whole seconds, network delay); republishing every wobble only churns the
+// recorder. The hob pushes a running timer's remaining time when it starts,
+// when it changes and at 0, and otherwise on 1% steps of the program
+// duration, not every second (13-15 s apart in the 2026-11-03/09 cloud
+// sessions; on 2026-11-12 elapsed and progress came every 20.5 s, and this
+// filter hides the remaining time's own cadence).
 const timerJitter = 2 * time.Second
+
+// While the panel is touched, a timer being set or changed stands still at
+// its new value and pushes nothing; it starts when the panel is released
+// (LocalControlActive false, about 10 s after the last touch) or another
+// control is touched, and the hob then pushes it again (2026-11-12: release
+// 19:07:21.782, pushes 21.798 and 22.009, end 19:14:22). Each typed digit is
+// pushed too: the "1" of 12 minutes reads 60 s for under a second. Deadlines
+// that arrive while the panel is touched are therefore held, so HA never
+// counts down a timer that stands still or a half-typed one; they go out
+// timerSettle after the release unless the hob's own push has replaced them,
+// or after maxTimerHold of continuous touching. A cleared timer (0) is never
+// held. Touching the panel for anything else does not stop a running timer
+// (2026-11-12 19:12:50, a power change): its next push is held at most
+// until the release, and the jitter filter drops it if it did not move.
+const (
+	timerSettle  = time.Second
+	maxTimerHold = 30 * time.Second
+)
 
 // updateDeadline converts a remaining time (seconds) into an RFC3339
 // wall-clock deadline and publishes it to suffix. Empty when no timer runs
 // (remaining <= 0), so HA renders "unknown" instead of a stale timestamp.
+// While the panel is touched a running deadline is held instead (see
+// timerSettle).
 func (b *Bridge) updateDeadline(suffix string, remainingSecs int) bool {
 	b.mu.Lock()
 	changed := b.updateDeadlineLocked(suffix, remainingSecs)
@@ -947,9 +988,27 @@ func (b *Bridge) updateDeadline(suffix string, remainingSecs int) bool {
 // the same critical section.
 func (b *Bridge) updateDeadlineLocked(suffix string, remainingSecs int) bool {
 	var deadline time.Time
+	now := time.Now()
 	if remainingSecs > 0 {
-		deadline = time.Now().Add(time.Duration(remainingSecs) * time.Second)
+		deadline = now.Add(time.Duration(remainingSecs) * time.Second)
 	}
+	if !deadline.IsZero() && b.localControl {
+		if len(b.held) == 0 {
+			b.heldSince = now
+		}
+		b.held[suffix] = deadline
+		if now.Sub(b.heldSince) < b.holdMax {
+			return false
+		}
+		// Touched for too long: publish the newest after all.
+	}
+	delete(b.held, suffix)
+	return b.setDeadlineLocked(suffix, deadline)
+}
+
+// setDeadlineLocked publishes a deadline unless it is within timerJitter of
+// the last one published to suffix.
+func (b *Bridge) setDeadlineLocked(suffix string, deadline time.Time) bool {
 	prev := b.deadlines[suffix]
 	if !deadline.IsZero() && !prev.IsZero() {
 		d := deadline.Sub(prev)
@@ -959,6 +1018,53 @@ func (b *Bridge) updateDeadlineLocked(suffix string, remainingSecs int) bool {
 	}
 	b.deadlines[suffix] = deadline
 	return b.publishLocked(suffix, formatDeadline(deadline))
+}
+
+// setLocalControl records whether the panel is touched. On release the held
+// deadlines go out after timerSettle, unless the hob's own push at release
+// (within 0.25 s on 2026-11-12) has replaced them by then.
+func (b *Bridge) setLocalControl(on bool) {
+	b.mu.Lock()
+	b.localControl = on
+	if b.flushTimer != nil {
+		b.flushTimer.Stop()
+		b.flushTimer = nil
+	}
+	changed := false
+	if !on && len(b.held) > 0 {
+		if b.settleDelay <= 0 {
+			changed = b.flushHeldLocked()
+		} else {
+			b.flushTimer = time.AfterFunc(b.settleDelay, b.flushHeld)
+		}
+	}
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
+}
+
+// flushHeld publishes the held deadlines, unless the panel is touched again.
+func (b *Bridge) flushHeld() {
+	b.mu.Lock()
+	changed := false
+	if !b.localControl {
+		b.flushTimer = nil
+		changed = b.flushHeldLocked()
+	}
+	b.mu.Unlock()
+	if changed {
+		b.kick()
+	}
+}
+
+func (b *Bridge) flushHeldLocked() bool {
+	changed := false
+	for s, d := range b.held {
+		changed = b.setDeadlineLocked(s, d) || changed
+	}
+	clear(b.held)
+	return changed
 }
 
 // resetOnPowerOff: once the hob is off no zone heats, no timer runs and no

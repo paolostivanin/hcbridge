@@ -28,11 +28,14 @@ var keyToSuffix = map[string]string{
 }
 
 // throttledSuffixes are published at most this often while they change.
-// The hob pushes elapsed time and progress every second while a program
-// runs; every tick as a retained publish only churns the broker and HA's
-// recorder. A change to or from zero or "no value" always goes out at once,
-// and the newest value held back goes out when the gap ends, so the last
-// one (progress 100) is never lost.
+// On the PXX801D67E elapsed time comes once a minute while no timer runs
+// and, with progress, every 1% of the duration while one does (about 20 s
+// on 2026-11-12), so the gap rarely holds anything back; it guards against
+// a firmware that pushes every second, where every tick as a retained
+// publish would only churn the broker and HA's recorder. A change to or
+// from zero or "no value" always goes out at once, and the newest value
+// held back goes out when the gap ends, so the last one (progress 100) is
+// never lost.
 var throttledSuffixes = map[string]time.Duration{
 	"status/elapsed_program_time": 15 * time.Second,
 	"status/program_progress":     15 * time.Second,

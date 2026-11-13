@@ -81,14 +81,22 @@ Appliance data:
 - `sensor.cooktop_power_state` - On / Off
 - `sensor.cooktop_active_program`
 - `sensor.cooktop_program_duration`, `_elapsed_program_time`, `_program_progress`
+  - the clock of the zone the panel has focus on: elapsed since that zone was
+  switched on, and with a timer set, duration = elapsed + timer. Not the
+  timer itself.
 - `sensor.cooktop_program_timer` - the program-level remaining time as a
-  wall-clock deadline (HA renders a live countdown)
+  wall-clock deadline. It follows the panel's focus (no value while a zone
+  without a timer has focus, even if another zone's timer runs), so use the
+  zone timers for a countdown
 - `sensor.cooktop_front_left_zone` / `_front_right_zone` / `_rear_left_zone` /
   `_rear_right_zone` - each zone's power level: `off`, `1`, `1.5`, ..., `9`,
   `KeepWarm`, `Boost1`, `Boost2`
 - `sensor.cooktop_<zone>_zone_state` - `off`, `active`, `residual_heat`,
   `paused`, `error`, `not_selectable`
-- `sensor.cooktop_<zone>_zone_timer` - that zone's timer as a deadline
+- `sensor.cooktop_<zone>_zone_timer` - that zone's timer as a deadline. A
+  timer being set or changed on the panel is published once the hob starts
+  counting it (see [8.2](#82-resilience)), so a dashboard can count down from
+  the deadline with no correction
 - `binary_sensor.cooktop_left_zones_joined` / `_right_zones_joined` - flex pairs merged
 - `sensor.cooktop_focused_zone` - the zone the panel has focus on
 - `sensor.cooktop_fan_level` - the integrated fan: `off`, `auto`, `1` ... `9`
@@ -354,8 +362,18 @@ Update anything in HA that used the removed entities
   directly. A state publish that is not acknowledged is sent again (events
   are not). The first broker connection may take as long as it needs (no exit
   on a boot race).
-  Values the hob pushes every second (elapsed time, progress) are published
-  at most every 15 s; the last one is always delivered.
+  Elapsed time and progress are published at most every 15 s; the last one
+  is always delivered. On this hob they arrive once a minute, or every 1% of
+  the duration while a timer runs (about 20 s), so the limit only guards
+  against a firmware that pushes every second.
+- **Timers**: each remaining time becomes a wall-clock deadline, republished
+  only when it moves by 2 s or more. While the panel is touched (setting or
+  changing a timer), the hob pushes each typed digit and then holds the new
+  value still until about 10 s after the last touch, when it starts counting.
+  Deadlines that arrive while the panel is touched are held and published 1 s
+  after the release, unless the hob's own push at release replaced them
+  first, so HA never counts down a half-typed or stationary timer. A cleared
+  timer goes out at once, and a hold ends after 30 s of continuous touching.
 - **Process**: under OpenRC `supervise-daemon` (see `openrc/hcbridge`) the
   bridge is restarted if it exits, and the healthcheck restarts it if the main
   loop stops refreshing `<state_dir>/alive`. A hob refusing connections does

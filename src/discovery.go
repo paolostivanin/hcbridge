@@ -148,8 +148,9 @@ func discoveryEntities(cfg *Config) []discoveryEntity {
 			"state_topic": st("joined_right"),
 			"icon":        "mdi:link-variant",
 		})),
-		// The program-level remaining time as a deadline (HA renders a live
-		// countdown). Each zone also has its own timer above.
+		// The program-level remaining time as a deadline. It is the timer of
+		// the zone the panel has focus on, not the soonest one: for a single
+		// countdown use the zone timers above.
 		data("sensor", "program_timer", "program_timer", "Program timer",
 			timestamp(st("status/program_timer_deadline"), "mdi:timer-sand")),
 		// No device_class: the "lock" class reads on=Unlocked, which showed an
